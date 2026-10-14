@@ -1,0 +1,20 @@
+{
+  "commands": {
+    "allow": ["python3 -m unittest -v"],
+    "deny": ["rm -rf workspace"]
+  },
+  "directories": {
+    "allow": ["."],
+    "deny": ["blocked"]
+  },
+  "protected_files": ["test_order.py"],
+  "limits": {
+    "model_requests": 30,
+    "tool_calls": 60,
+    "side_effects": 12,
+    "tool_output_bytes": 50000,
+    "single_result_bytes": 10000,
+    "bash_seconds": 20,
+    "file_bytes": 100000
+  }
+}

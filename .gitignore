@@ -1,0 +1,12 @@
+.env
+.agent_state/
+state/
+.venv/
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
