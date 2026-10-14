@@ -1,10 +1,3 @@
-# Coding Agent
-
-## Требования
-
-- Python 3.12
-- Ollama с моделью `qwen3:4b`
-
 ## Установка
 
 ```bash
