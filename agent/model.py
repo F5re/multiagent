@@ -21,16 +21,7 @@ PLAN_FORMAT = {
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                     "tools": {
                         "type": "array",
-                        "items": {
-                            "enum": [
-                                "Bash",
-                                "list_files",
-                                "read_file",
-                                "write_file",
-                                "delete_file",
-                                "load_skill",
-                            ]
-                        },
+                        "items": {"type": "string"},
                     },
                     "verification": {
                         "type": "object",

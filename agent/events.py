@@ -26,6 +26,9 @@ def format_event(event: dict) -> str:
         return f"[skill] Loaded: {data.get('name', 'unknown')}"
     if kind == "mcp_call":
         return f"[mcp] {data.get('server')}/{data.get('name')}: requested"
+    if kind == "mcp_result":
+        status = "success" if data.get("ok") else "error"
+        return f"[mcp] {data.get('server')}/{data.get('name')}: {status}"
     return f"[{kind}] {json.dumps(data, ensure_ascii=False)}"
 
 

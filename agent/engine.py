@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 from agent.events import format_event
+from agent.mcp_client import MCPClient
 from agent.policy import Policy
 from agent.skills import SkillRegistry
 from agent.storage import Store
@@ -22,7 +23,7 @@ VERIFY_TOOL = {
 }
 
 
-def parse_plan(text: str) -> dict:
+def parse_plan(text: str, available_tools: set[str] | None = None) -> dict:
     try:
         plan = json.loads(text)
     except json.JSONDecodeError as error:
@@ -74,7 +75,8 @@ def parse_plan(text: str) -> dict:
             raise AgentError(f"task {task_id} must have at least one tool")
         if not all(isinstance(item, str) for item in tools):
             raise AgentError(f"task {task_id} contains unknown tools")
-        unknown_tools = [item for item in tools if item not in SCHEMAS]
+        known_tools = set(SCHEMAS) | (available_tools or set())
+        unknown_tools = [item for item in tools if item not in known_tools]
         if unknown_tools:
             raise AgentError(
                 f"task {task_id} contains unknown tools: {', '.join(unknown_tools)}"
@@ -150,6 +152,7 @@ class Agent:
         after_tool=None,
         skills_dir: Path | None = None,
         skills_enabled: bool = True,
+        mcp_config: Path | None = None,
     ) -> None:
         self.policy = Policy(workspace, policy_file)
         self.store = Store(state_file)
@@ -157,6 +160,10 @@ class Agent:
         self.after_tool = after_tool
         self.skills = SkillRegistry(
             skills_dir or workspace.parent / "skills", skills_enabled
+        )
+        default_mcp = workspace.parent / "config" / "mcp.json"
+        self.mcp = MCPClient(
+            mcp_config or (default_mcp if default_mcp.exists() else None)
         )
 
     def start(
@@ -207,6 +214,21 @@ class Agent:
                         }
                     ]
                     if self.skills.catalog()
+                    else []
+                ),
+                *(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Configured MCP tools: "
+                                + ", ".join(sorted(self.mcp.names()))
+                                + ". They are external tools and remain subject "
+                                "to runtime policy."
+                            ),
+                        }
+                    ]
+                    if self.mcp.names()
                     else []
                 ),
                 *(
@@ -381,6 +403,7 @@ class Agent:
             offered = [
                 tool for tool in offered if tool["function"]["name"] != "load_skill"
             ]
+        offered.extend(self.mcp.definitions(planning, permitted))
         try:
             reply = self.model.complete(state["messages"], offered, planning)
         except Exception as error:
@@ -457,7 +480,7 @@ class Agent:
             return
         if planning:
             try:
-                state["plan"] = parse_plan(content)
+                state["plan"] = parse_plan(content, self.mcp.names())
             except AgentError as error:
                 state["plan_errors"] = state.get("plan_errors", 0) + 1
                 if state["plan_errors"] >= 3:
@@ -603,12 +626,17 @@ class Agent:
                 self.store.save(state)
                 return
             try:
-                validate(call["name"], call["arguments"])
-                self.policy.check(
-                    call["name"],
-                    call["arguments"],
-                    planning=state["phase"] == "planning",
-                )
+                if call["name"] in self.mcp.names():
+                    self.mcp.validate(call["name"], call["arguments"])
+                    server, remote_name = self.mcp.details(call["name"])
+                    self.policy.mcp(server, remote_name, call["arguments"])
+                else:
+                    validate(call["name"], call["arguments"])
+                    self.policy.check(
+                        call["name"],
+                        call["arguments"],
+                        planning=state["phase"] == "planning",
+                    )
                 task = (
                     self._current_task(state) if state["phase"] == "running" else None
                 )
@@ -641,7 +669,20 @@ class Agent:
         call["status"] = "started"
         self.store.save(state)
         try:
-            if call["name"] == "load_skill":
+            if call["name"] in self.mcp.names():
+                server, remote_name = self.mcp.details(call["name"])
+                self._event(
+                    state,
+                    "mcp_call",
+                    {
+                        "server": server,
+                        "name": remote_name,
+                        "arguments": call["arguments"],
+                    },
+                    True,
+                )
+                data = self.mcp.call(call["name"], call["arguments"])
+            elif call["name"] == "load_skill":
                 skill = self.skills.load(call["arguments"]["name"])
                 data = {
                     "name": skill.name,
@@ -709,6 +750,19 @@ class Agent:
             },
             True,
         )
+        if call["name"] in self.mcp.names():
+            server, remote_name = self.mcp.details(call["name"])
+            self._event(
+                state,
+                "mcp_result",
+                {
+                    "server": server,
+                    "name": remote_name,
+                    "ok": bool(payload.get("ok")),
+                    "result": payload,
+                },
+                True,
+            )
 
     @staticmethod
     def _reopen_change_after_failed_tests(

@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "project_tracker": {
+      "command": ["{python}", "-m", "mcp_servers.project_tracker"],
+      "timeout_seconds": 3
+    }
+  }
+}

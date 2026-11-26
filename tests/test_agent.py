@@ -9,6 +9,7 @@ import agent.engine as engine_module
 from agent.cli import show
 from agent.engine import Agent, AgentError, parse_plan
 from agent.events import format_event
+from agent.mcp_client import MCPClient, MCPError
 from agent.model import FakeModel, text_tool_calls
 from agent.policy import Policy, PolicyError
 from agent.skills import SkillRegistry
@@ -986,3 +987,79 @@ def test_skills_can_be_disabled_for_variant_a(tmp_path: Path) -> None:
     assert "load_skill" not in {
         tool["function"]["name"] for tool in agent.model.requests[0][1]
     }
+
+
+def test_mcp_discovers_and_calls_configured_tool() -> None:
+    client = MCPClient(ROOT / "config" / "mcp.json")
+
+    assert "mcp__project_tracker__get_issue" in client.names()
+    result = client.call("mcp__project_tracker__get_issue", {"issue_id": "ISSUE-1"})
+    issue = json.loads(result["content"][0]["text"])
+    assert issue["file"] == "order.py"
+
+
+def test_mcp_error_and_timeout_are_clear(tmp_path: Path) -> None:
+    config = {
+        "servers": {
+            "project_tracker": {
+                "command": [
+                    "{python}",
+                    str(ROOT / "mcp_servers" / "project_tracker.py"),
+                ],
+                "timeout_seconds": 0.1,
+            }
+        }
+    }
+    filename = tmp_path / "config" / "mcp.json"
+    filename.parent.mkdir()
+    filename.write_text(json.dumps(config), encoding="utf-8")
+    client = MCPClient(filename)
+
+    with pytest.raises(MCPError, match="synthetic tracker failure"):
+        client.call("mcp__project_tracker__get_issue", {"issue_id": "ERROR"})
+    with pytest.raises(MCPError, match="timed out"):
+        client.call("mcp__project_tracker__get_issue", {"issue_id": "TIMEOUT"})
+
+
+def test_mcp_policy_can_deny_an_available_tool(tmp_path: Path) -> None:
+    workspace, policy_file, _ = make_project(tmp_path)
+    data = json.loads(policy_file.read_text(encoding="utf-8"))
+    data["mcp"]["allow_tools"]["project_tracker"] = []
+    policy_file.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(PolicyError, match="MCP tool is not allowed"):
+        Policy(workspace, policy_file).mcp(
+            "project_tracker", "get_issue", {"issue_id": "ISSUE-1"}
+        )
+
+
+def test_agent_exposes_and_logs_mcp_calls(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(
+                    call(
+                        "issue",
+                        "mcp__project_tracker__get_issue",
+                        issue_id="ISSUE-1",
+                    )
+                ),
+                plan_reply(),
+            ]
+        ),
+        mcp_config=ROOT / "config" / "mcp.json",
+    )
+
+    state = agent.start("Inspect issue ISSUE-1")
+
+    assert state["phase"] == "waiting_plan"
+    assert "mcp__project_tracker__get_issue" in {
+        tool["function"]["name"] for tool in agent.model.requests[0][1]
+    }
+    event_types = [event["type"] for event in agent.store.events(state["session_id"])]
+    assert "mcp_call" in event_types
+    assert "mcp_result" in event_types
