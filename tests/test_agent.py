@@ -18,6 +18,7 @@ from agent.policy import Policy, PolicyError
 from agent.skills import SkillRegistry
 from agent.storage import StateConflict, Store
 from agent.tools import execute as real_execute
+from agent.updates import SkillUpdater, UpdateError
 
 ROOT = Path(__file__).parents[1]
 BROKEN = (
@@ -1280,3 +1281,76 @@ def test_market_install_is_a_verified_approved_runtime_action(
     )
     completed = agent.decide_action(waiting_action["id"], True)
     assert completed["phase"] == "completed"
+
+
+def update_results(*, regression: bool = False, complete: bool = True) -> list[dict]:
+    results = []
+    for case_id in (
+        "fix-failing-test",
+        "python-review",
+        "no-matching-skill",
+        "missing-data",
+        "mcp-failure",
+    ):
+        for variant in ("old", "new"):
+            passed = not (
+                regression and case_id == "python-review" and variant == "new"
+            )
+            results.append(
+                {
+                    "case_id": case_id,
+                    "variant": variant,
+                    "outcome_pass": passed,
+                    "routing_pass_or_na": True,
+                    "usage_complete": complete,
+                    "input_tokens": 100 if complete else None,
+                    "output_tokens": 10 if complete else None,
+                }
+            )
+    return results
+
+
+def test_update_decision_accepts_only_non_regressing_complete_results(
+    tmp_path: Path,
+) -> None:
+    updater = SkillUpdater(
+        ROOT,
+        ROOT / "config" / "market.json",
+        skills_dir=ROOT / "skills",
+        state_dir=tmp_path / "updates",
+    )
+
+    accepted = updater.decide(update_results())
+    regressed = updater.decide(update_results(regression=True))
+    incomplete = updater.decide(update_results(complete=False))
+
+    assert accepted["accepted"] is True
+    assert regressed["accepted"] is False
+    assert any("decreased" in reason for reason in regressed["reasons"])
+    assert incomplete["accepted"] is False
+    assert "token usage is incomplete" in incomplete["reasons"]
+
+
+def test_skill_update_applies_atomically_and_rolls_back(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    updater = SkillUpdater(
+        ROOT,
+        ROOT / "config" / "market.json",
+        skills_dir=skills,
+        state_dir=tmp_path / "updates",
+    )
+    updater.market.stage("investigate-test-failure")
+
+    applied = updater.apply("investigate-test-failure")
+    assert applied["old_version"] == "1.0.0"
+    assert SkillRegistry(skills).load("investigate-test-failure").version == "2.0.0"
+
+    rolled_back = updater.rollback("investigate-test-failure")
+    assert rolled_back["to_version"] == "1.0.0"
+    assert SkillRegistry(skills).load("investigate-test-failure").version == "1.0.0"
+    with pytest.raises(UpdateError, match="no rollback"):
+        updater.rollback("investigate-test-failure")

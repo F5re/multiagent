@@ -20,11 +20,16 @@ class EvalRunner:
         cases_file: Path,
         output: Path,
         model_factory: Callable[[], object] = ChatModel,
+        variant_skills: dict[str, tuple[bool, Path]] | None = None,
     ) -> None:
         self.root = root
         self.cases_file = cases_file
         self.output = output
         self.model_factory = model_factory
+        self.variant_skills = variant_skills or {
+            "A": (False, root / "skills"),
+            "B": (True, root / "skills"),
+        }
         self.cases = self._load_cases()
         self.results_file = output / "results.jsonl"
 
@@ -58,7 +63,7 @@ class EvalRunner:
         }
         for case in self.cases:
             for trial in range(1, trials + 1):
-                for variant in ("A", "B"):
+                for variant in self.variant_skills:
                     key = (case["id"], variant, trial)
                     if key in completed:
                         print(f"[eval] Skip saved trial: {case['id']} {variant}{trial}")
@@ -83,8 +88,8 @@ class EvalRunner:
             self.root / "config" / "policy.json",
             state_file,
             self.model_factory(),
-            skills_dir=self.root / "skills",
-            skills_enabled=variant == "B",
+            skills_dir=self.variant_skills[variant][1],
+            skills_enabled=self.variant_skills[variant][0],
             mcp_config=self.root / "config" / "mcp.json",
         )
         session_id = agent.store.create_session()
@@ -110,7 +115,9 @@ class EvalRunner:
         loaded = sorted(state.get("loaded_skills", {}))
         expected = case["expected_skill"]
         routing = (
-            "n/a" if variant == "A" else (loaded == ([expected] if expected else []))
+            loaded == ([expected] if expected else [])
+            if self.variant_skills[variant][0]
+            else "n/a"
         )
         called_tools = [
             event["data"].get("name")

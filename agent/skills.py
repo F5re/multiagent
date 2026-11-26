@@ -37,7 +37,7 @@ class SkillRegistry:
                 self.errors.append({"path": str(filename), "error": str(error)})
 
     @staticmethod
-    def _read(filename: Path) -> Skill:
+    def _read(filename: Path, require_directory_name: bool = True) -> Skill:
         content = filename.read_text(encoding="utf-8")
         lines = content.splitlines()
         if not lines or lines[0].strip() != "---":
@@ -75,7 +75,7 @@ class SkillRegistry:
         version = fields.get("version", "1.0.0")
         if not name or not description:
             raise SkillError("skill name and description are required")
-        if filename.parent.name != name:
+        if require_directory_name and filename.parent.name != name:
             raise SkillError("skill name must match its directory")
         body = "\n".join(lines[end + 1 :]).strip()
         if not body:

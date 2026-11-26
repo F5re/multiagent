@@ -12,6 +12,7 @@ from agent.model import ChatModel, ModelError
 from agent.policy import PolicyError
 from agent.skills import SkillRegistry
 from agent.storage import StateConflict, Store
+from agent.updates import SkillUpdater, UpdateError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -71,12 +72,35 @@ def parser() -> argparse.ArgumentParser:
     market_install = market_commands.add_parser("install")
     market_install.add_argument("name")
     market_commands.add_parser("check")
+    update = commands.add_parser("update")
+    update.add_argument("--market", type=Path, default=root / "config" / "market.json")
+    update_commands = update.add_subparsers(dest="update_command", required=True)
+    update_evaluate = update_commands.add_parser("evaluate")
+    update_evaluate.add_argument("name")
+    update_evaluate.add_argument("--trials", type=int, default=3)
+    for name in ("status", "apply", "rollback"):
+        update_commands.add_parser(name).add_argument("name")
     return result
 
 
 def main(arguments: list[str] | None = None) -> int:
     arguments_object = parser().parse_args(arguments)
     try:
+        if arguments_object.command == "update":
+            root = Path(__file__).resolve().parent.parent
+            updater = SkillUpdater(root, arguments_object.market)
+            if arguments_object.update_command == "evaluate":
+                result = updater.evaluate(
+                    arguments_object.name, arguments_object.trials
+                )
+            elif arguments_object.update_command == "apply":
+                result = updater.apply(arguments_object.name)
+            elif arguments_object.update_command == "rollback":
+                result = updater.rollback(arguments_object.name)
+            else:
+                result = updater.status(arguments_object.name)
+            print_update_result(result)
+            return 0
         if arguments_object.command == "market":
             root = Path(__file__).resolve().parent.parent
             market = Market(
@@ -179,6 +203,7 @@ def main(arguments: list[str] | None = None) -> int:
         ValueError,
         EvalError,
         MarketError,
+        UpdateError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
@@ -262,6 +287,25 @@ def print_market_entries(entries: list[dict], title: str) -> None:
         revision = str(item.get("revision", ""))[:12]
         suffix = f" [{revision}]" if revision else ""
         print(f"  {item['name']} {item['version']}{suffix} — {item['description']}")
+
+
+def print_update_result(result: dict) -> None:
+    print(f"Skill update: {result.get('skill', result.get('name', 'unknown'))}")
+    for key in (
+        "active_version",
+        "candidate_version",
+        "old_version",
+        "new_version",
+        "from_version",
+        "to_version",
+        "accepted",
+        "action",
+        "token_growth",
+    ):
+        if key in result:
+            print(f"  {key}: {result[key]}")
+    for reason in result.get("reasons", []):
+        print(f"  reason: {reason}")
 
 
 def entrypoint() -> None:
