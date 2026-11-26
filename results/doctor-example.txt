@@ -1,0 +1,11 @@
+Doctor: session 3cfa476349154146ac38dd9e0304817f
+Events analyzed: 26
+Runs: 1; tokens: input=14249; output=883
+Skills: {'investigate-test-failure': 1}
+Tools: {'load_skill': 1, 'mcp__project_tracker__get_issue': 2}
+MCP calls: {'project_tracker/get_issue': 2}
+1. repeated_tool_error — run 360148e617fa45aa972b3f76784f0c45
+   Events: 205fd648b0344e499167a7e4361a4398, 6371f70ede694a98838f51dd86e783b7
+   Counters: {"tool": "mcp__project_tracker__get_issue", "failures": 2}
+   Meaning: Tool mcp__project_tracker__get_issue failed 2 times in one run.
+   Suggestion: Inspect the first error before repeating the same call.
