@@ -11,6 +11,7 @@ from agent.engine import Agent, AgentError, parse_plan
 from agent.events import format_event
 from agent.model import FakeModel, text_tool_calls
 from agent.policy import Policy, PolicyError
+from agent.skills import SkillRegistry
 from agent.storage import StateConflict, Store
 from agent.tools import execute as real_execute
 
@@ -33,11 +34,11 @@ INCOMPLETE = (
 )
 
 
-def call(call_id: str, name: str, **arguments: str) -> dict:
+def call(call_id: str, tool_name: str, **arguments: str) -> dict:
     return {
         "id": call_id,
         "type": "function",
-        "function": {"name": name, "arguments": json.dumps(arguments)},
+        "function": {"name": tool_name, "arguments": json.dumps(arguments)},
     }
 
 
@@ -500,7 +501,8 @@ def test_plan_mode_blocks_side_effects_and_repairs_invalid_plan(tmp_path: Path) 
     assert state["used"]["side_effects"] == 0
     assert json.loads(state["calls"]["bad"]["result"])["ok"] is False
     assert all(
-        {tool["function"]["name"] for tool in tools} <= {"list_files", "read_file"}
+        {tool["function"]["name"] for tool in tools}
+        <= {"list_files", "read_file", "load_skill"}
         for _, tools in agent.model.requests
     )
 
@@ -912,3 +914,75 @@ def test_model_usage_is_saved_and_logged(tmp_path: Path) -> None:
     }
     events = agent.store.events(state["session_id"])
     assert [event["type"] for event in events] == ["run_started", "model_usage"]
+
+
+def test_skill_is_discovered_selected_and_loaded(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(
+                    call(
+                        "skill",
+                        "load_skill",
+                        name="investigate-test-failure",
+                    )
+                ),
+                plan_reply(),
+            ]
+        ),
+    )
+
+    state = agent.start("Fix a failing test")
+
+    assert state["phase"] == "waiting_plan"
+    assert state["loaded_skills"] == {"investigate-test-failure": "1.0.0"}
+    first_tools = {tool["function"]["name"] for tool in agent.model.requests[0][1]}
+    assert "load_skill" in first_tools
+    initial_messages = agent.model.requests[0][0]
+    assert "investigate-test-failure" in initial_messages[1]["content"]
+    assert "Run the relevant tests" not in initial_messages[1]["content"]
+    events = agent.store.events(state["session_id"])
+    assert "skill_discovered" in {event["type"] for event in events}
+    assert "skill_loaded" in {event["type"] for event in events}
+
+
+def test_invalid_skill_does_not_hide_valid_skills(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    shutil.copytree(ROOT / "skills" / "release-notes", root / "release-notes")
+    broken = root / "broken"
+    broken.mkdir()
+    (broken / "SKILL.md").write_text("not frontmatter", encoding="utf-8")
+
+    registry = SkillRegistry(root)
+
+    assert [skill["name"] for skill in registry.catalog()] == ["release-notes"]
+    assert registry.errors[0]["path"].endswith("broken/SKILL.md")
+
+
+def test_skills_can_be_disabled_for_variant_a(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(ROOT / "skills" / "release-notes", skills / "release-notes")
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel([plan_reply()]),
+        skills_enabled=False,
+    )
+
+    state = agent.start("Fix")
+
+    assert state["loaded_skills"] == {}
+    assert "load_skill" not in {
+        tool["function"]["name"] for tool in agent.model.requests[0][1]
+    }

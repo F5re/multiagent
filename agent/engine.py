@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent.events import format_event
 from agent.policy import Policy
+from agent.skills import SkillRegistry
 from agent.storage import Store
 from agent.tools import SCHEMAS, SIDE_EFFECTS, definitions, execute, file_hash, validate
 
@@ -147,11 +148,16 @@ class Agent:
         state_file: Path,
         model,
         after_tool=None,
+        skills_dir: Path | None = None,
+        skills_enabled: bool = True,
     ) -> None:
         self.policy = Policy(workspace, policy_file)
         self.store = Store(state_file)
         self.model = model
         self.after_tool = after_tool
+        self.skills = SkillRegistry(
+            skills_dir or workspace.parent / "skills", skills_enabled
+        )
 
     def start(
         self, request: str, mode: str = "auto", session_id: str | None = None
@@ -187,6 +193,22 @@ class Agent:
                         "and do not edit tests. Answer concisely."
                     ),
                 },
+                *(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Available skills are listed below. Choose whether "
+                                "one is relevant. Load only a relevant skill with "
+                                "load_skill before returning the plan. You may work "
+                                "without a skill. Catalog: "
+                                + json.dumps(self.skills.catalog(), ensure_ascii=False)
+                            ),
+                        }
+                    ]
+                    if self.skills.catalog()
+                    else []
+                ),
                 *(
                     [
                         {
@@ -253,11 +275,16 @@ class Agent:
                 "output_tokens": 0,
                 "complete": True,
             },
+            "loaded_skills": {},
             "answer": None,
             "error": None,
         }
         self.store.create(state)
         self._event(state, "run_started", {"request": request, "mode": mode}, True)
+        for skill in self.skills.catalog():
+            self._event(state, "skill_discovered", skill)
+        for error in self.skills.errors:
+            self._event(state, "skill_error", error, True)
         return self.drive(run_id)
 
     def drive(self, run_id: str) -> dict:
@@ -350,6 +377,10 @@ class Agent:
         task = self._current_task(state) if not planning else None
         permitted = set(task["tools"]) if task else set() if not planning else None
         offered = definitions(planning, permitted)
+        if not self.skills.catalog():
+            offered = [
+                tool for tool in offered if tool["function"]["name"] != "load_skill"
+            ]
         try:
             reply = self.model.complete(state["messages"], offered, planning)
         except Exception as error:
@@ -610,17 +641,45 @@ class Agent:
         call["status"] = "started"
         self.store.save(state)
         try:
-            data = execute(
-                self.policy,
-                call["name"],
-                call["arguments"],
-                call["reserved_output"],
-            )
+            if call["name"] == "load_skill":
+                skill = self.skills.load(call["arguments"]["name"])
+                data = {
+                    "name": skill.name,
+                    "version": skill.version,
+                    "instructions": skill.content,
+                }
+            else:
+                data = execute(
+                    self.policy,
+                    call["name"],
+                    call["arguments"],
+                    call["reserved_output"],
+                )
             payload = {"ok": True, "data": data}
         except Exception as error:
             payload = {"ok": False, "error": f"{type(error).__name__}: {error}"}
         if self.after_tool:
             self.after_tool(call)
+        if call["name"] == "load_skill" and payload.get("ok"):
+            skill_data = payload.get("data")
+            if not isinstance(skill_data, dict):
+                raise AgentError("load_skill returned invalid data")
+            state["loaded_skills"][skill_data["name"]] = skill_data["version"]
+            state["messages"].append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"Loaded skill {skill_data['name']} version "
+                        f"{skill_data['version']}:\n{skill_data['instructions']}"
+                    ),
+                }
+            )
+            self._event(
+                state,
+                "skill_loaded",
+                {"name": skill_data["name"], "version": skill_data["version"]},
+                True,
+            )
         self._finish_call(state, call, payload)
 
     def _finish_call(self, state: dict, call: dict, payload: dict) -> None:

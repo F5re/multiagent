@@ -28,6 +28,7 @@ PLAN_FORMAT = {
                                 "read_file",
                                 "write_file",
                                 "delete_file",
+                                "load_skill",
                             ]
                         },
                     },
