@@ -11,6 +11,7 @@ from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError, parse_plan
 from agent.evals import EvalRunner
 from agent.events import format_event
+from agent.market import Market, MarketError
 from agent.mcp_client import MCPClient, MCPError
 from agent.model import FakeModel, text_tool_calls
 from agent.policy import Policy, PolicyError
@@ -1178,3 +1179,104 @@ def test_eval_runner_restores_trials_checks_results_and_resumes(
     assert {item["variant"] for item in first} == {"A", "B"}
     assert (tmp_path / "results" / "summary.md").is_file()
     assert len((tmp_path / "results" / "results.jsonl").read_text().splitlines()) == 2
+
+
+def test_market_detects_new_update_and_does_not_restage(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    market = Market(ROOT / "config" / "market.json", skills, tmp_path / "market-state")
+
+    first = market.check()
+    second = market.check()
+
+    assert {item["name"] for item in first["new"]} == {
+        "security-review",
+        "broken-skill",
+    }
+    assert first["updates"][0]["name"] == "investigate-test-failure"
+    assert first["staged"] == ["investigate-test-failure"]
+    assert second["staged"] == []
+    assert market.candidate("investigate-test-failure").is_dir()
+
+
+def test_market_installs_valid_package_and_keeps_invalid_out(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    market = Market(ROOT / "config" / "market.json", skills, tmp_path / "market-state")
+
+    found = market.search("security")
+    installed = market.install("security-review")
+
+    assert found[0]["name"] == "security-review"
+    assert installed["installed"] is True
+    assert (skills / "security-review" / "SKILL.md").is_file()
+    with pytest.raises(MarketError):
+        market.install("broken-skill")
+    assert not (skills / "broken-skill").exists()
+    assert (skills / "security-review" / "SKILL.md").is_file()
+
+
+def test_market_auto_update_can_be_disabled(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    market = Market(
+        ROOT / "config" / "market_v2_no_update.json",
+        skills,
+        tmp_path / "market-state",
+    )
+
+    result = market.check()
+
+    assert result["updates"]
+    assert result["staged"] == []
+
+
+def test_market_install_is_a_verified_approved_runtime_action(
+    tmp_path: Path,
+) -> None:
+    project = make_project(tmp_path)
+    plan = {
+        "goal": "Install security review skill",
+        "steps": [
+            {
+                "id": "install",
+                "description": "Install the selected skill",
+                "depends_on": [],
+                "tools": ["install_skill"],
+                "verification": {
+                    "kind": "skill_installed",
+                    "name": "security-review",
+                },
+            }
+        ],
+        "risks": [],
+        "assumptions": [],
+        "done_when": "Skill is installed",
+    }
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                final(json.dumps(plan)),
+                tool_reply(call("install", "install_skill", name="security-review")),
+                final("Installed."),
+            ]
+        ),
+        market_config=ROOT / "config" / "market.json",
+    )
+    waiting_plan = agent.start("Install a security review skill")
+    waiting_action = agent.approve_plan(waiting_plan["id"], True)
+
+    assert waiting_action["phase"] == "waiting_action"
+    assert (
+        waiting_action["calls"][waiting_action["queue"][0]]["name"] == "install_skill"
+    )
+    completed = agent.decide_action(waiting_action["id"], True)
+    assert completed["phase"] == "completed"

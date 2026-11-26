@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 from agent.events import format_event
+from agent.market import Market
 from agent.mcp_client import MCPClient
 from agent.policy import Policy
 from agent.skills import SkillRegistry
@@ -20,6 +21,7 @@ VERIFY_TOOL = {
     "file_changed": "write_file",
     "file_deleted": "delete_file",
     "tests_pass": "Bash",
+    "skill_installed": "install_skill",
 }
 
 
@@ -90,6 +92,8 @@ def parse_plan(text: str, available_tools: set[str] | None = None) -> dict:
             if kind == "read_files"
             else "command"
             if kind == "tests_pass"
+            else "name"
+            if kind == "skill_installed"
             else "path"
         )
         if set(proof) != {"kind", key}:
@@ -153,6 +157,7 @@ class Agent:
         skills_dir: Path | None = None,
         skills_enabled: bool = True,
         mcp_config: Path | None = None,
+        market_config: Path | None = None,
     ) -> None:
         self.policy = Policy(workspace, policy_file)
         self.store = Store(state_file)
@@ -164,6 +169,12 @@ class Agent:
         default_mcp = workspace.parent / "config" / "mcp.json"
         self.mcp = MCPClient(
             mcp_config or (default_mcp if default_mcp.exists() else None)
+        )
+        default_market = workspace.parent / "config" / "market.json"
+        self.market = Market(
+            market_config or (default_market if default_market.exists() else None),
+            self.skills.root,
+            state_file.parent / "market",
         )
 
     def start(
@@ -307,6 +318,17 @@ class Agent:
             self._event(state, "skill_discovered", skill)
         for error in self.skills.errors:
             self._event(state, "skill_error", error, True)
+        if self.market.available() and self.market.config.get("auto_check", False):
+            try:
+                result = self.market.check()
+                self._event(state, "market_check", result, True)
+            except Exception as error:
+                self._event(
+                    state,
+                    "market_error",
+                    {"message": f"{type(error).__name__}: {error}"},
+                    True,
+                )
         return self.drive(run_id)
 
     def drive(self, run_id: str) -> dict:
@@ -407,6 +429,12 @@ class Agent:
         if not self.skills.catalog():
             offered = [
                 tool for tool in offered if tool["function"]["name"] != "load_skill"
+            ]
+        if not self.market.available():
+            offered = [
+                tool
+                for tool in offered
+                if tool["function"]["name"] not in {"search_market", "install_skill"}
             ]
         offered.extend(self.mcp.definitions(planning, permitted))
         try:
@@ -678,8 +706,14 @@ class Agent:
         call["attempts"].append(attempt)
         call["status"] = "started"
         self.store.save(state)
+        data: dict
         try:
-            if call["name"] in self.mcp.names():
+            if call["name"] == "search_market":
+                data = {"skills": self.market.search(call["arguments"]["query"])}
+            elif call["name"] == "install_skill":
+                data = self.market.install(call["arguments"]["name"])
+                self._event(state, "skill_installed", data, True)
+            elif call["name"] in self.mcp.names():
                 server, remote_name = self.mcp.details(call["name"])
                 self._event(
                     state,
@@ -915,6 +949,14 @@ class Agent:
                     and not data.get("timed_out")
                 ):
                     return {"tool_call_id": call["id"], "exit_code": 0}
+        if kind == "skill_installed":
+            for call, _ in calls:
+                if (
+                    call["name"] == "install_skill"
+                    and call["arguments"]["name"] == proof["name"]
+                    and self.market.installed(proof["name"])
+                ):
+                    return {"tool_call_id": call["id"], "installed": True}
         return None
 
     @staticmethod

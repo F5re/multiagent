@@ -32,6 +32,7 @@ PLAN_FORMAT = {
                                     "file_changed",
                                     "file_deleted",
                                     "tests_pass",
+                                    "skill_installed",
                                 ]
                             },
                             "paths": {
@@ -40,6 +41,7 @@ PLAN_FORMAT = {
                             },
                             "path": {"type": "string"},
                             "command": {"type": "string"},
+                            "name": {"type": "string"},
                         },
                         "required": ["kind"],
                         "additionalProperties": False,

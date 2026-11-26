@@ -89,7 +89,7 @@ class Policy:
         return directory
 
     def check(self, name: str, arguments: dict, *, planning: bool) -> None:
-        if name == "load_skill":
+        if name in {"load_skill", "search_market", "install_skill"}:
             return
         if planning and name not in {"list_files", "read_file"}:
             raise PolicyError("Plan Mode permits reading only")
@@ -102,7 +102,7 @@ class Policy:
             )
 
     def needs_approval(self, name: str, mode: str) -> bool:
-        return name == "delete_file" or (
+        return name in {"delete_file", "install_skill"} or (
             mode == "safe" and name in {"write_file", "Bash"}
         )
 

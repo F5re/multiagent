@@ -17,12 +17,18 @@ SCHEMAS = {
     "delete_file": {"path": str},
     "Bash": {"command": str, "cwd": str},
     "load_skill": {"name": str},
+    "search_market": {"query": str},
+    "install_skill": {"name": str},
 }
-SIDE_EFFECTS = {"write_file", "delete_file", "Bash"}
+SIDE_EFFECTS = {"write_file", "delete_file", "Bash", "install_skill"}
 
 
 def definitions(planning: bool, permitted: set[str] | None = None) -> list[dict]:
-    names = {"list_files", "read_file", "load_skill"} if planning else set(SCHEMAS)
+    names = (
+        {"list_files", "read_file", "load_skill", "search_market"}
+        if planning
+        else set(SCHEMAS)
+    )
     if permitted is not None:
         names &= permitted
     descriptions = {
@@ -32,6 +38,8 @@ def definitions(planning: bool, permitted: set[str] | None = None) -> list[dict]
         "delete_file": "Delete one workspace file.",
         "Bash": "Run one exact allowlisted command in a workspace directory.",
         "load_skill": "Load the full instructions of one relevant skill.",
+        "search_market": "Search for relevant skills that are not installed.",
+        "install_skill": "Install one validated skill from the configured market.",
     }
     result = []
     for name in SCHEMAS:

@@ -7,8 +7,10 @@ from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError
 from agent.evals import EvalError, EvalRunner
 from agent.events import format_event, format_stats
+from agent.market import Market, MarketError
 from agent.model import ChatModel, ModelError
 from agent.policy import PolicyError
+from agent.skills import SkillRegistry
 from agent.storage import StateConflict, Store
 
 
@@ -60,12 +62,47 @@ def parser() -> argparse.ArgumentParser:
     evaluation_commands.add_parser("summary").add_argument(
         "--output", type=Path, default=root / "results" / "baseline"
     )
+    market = commands.add_parser("market")
+    market.add_argument("--config", type=Path, default=root / "config" / "market.json")
+    market_commands = market.add_subparsers(dest="market_command", required=True)
+    market_commands.add_parser("list")
+    market_search = market_commands.add_parser("search")
+    market_search.add_argument("query")
+    market_install = market_commands.add_parser("install")
+    market_install.add_argument("name")
+    market_commands.add_parser("check")
     return result
 
 
 def main(arguments: list[str] | None = None) -> int:
     arguments_object = parser().parse_args(arguments)
     try:
+        if arguments_object.command == "market":
+            root = Path(__file__).resolve().parent.parent
+            market = Market(
+                arguments_object.config,
+                root / "skills",
+                root / ".agent_state" / "market",
+            )
+            if arguments_object.market_command == "search":
+                entries = market.search(arguments_object.query)
+                print_market_entries(entries, "Search results")
+            elif arguments_object.market_command == "install":
+                installed_entry = market.install(arguments_object.name)
+                print(
+                    f"Installed {installed_entry['name']} "
+                    f"{installed_entry['version']} "
+                    f"({installed_entry['revision'][:12]})"
+                )
+            elif arguments_object.market_command == "check":
+                result = market.check()
+                print_market_entries(result["new"], "New skills")
+                print_market_entries(result["updates"], "Updates")
+                print(f"Staged candidates: {', '.join(result['staged']) or 'none'}")
+            else:
+                installed_skills = SkillRegistry(root / "skills").catalog()
+                print_market_entries(installed_skills, "Installed skills")
+            return 0
         if arguments_object.command == "eval":
             runner = EvalRunner(
                 Path(__file__).resolve().parent.parent,
@@ -141,6 +178,7 @@ def main(arguments: list[str] | None = None) -> int:
         KeyError,
         ValueError,
         EvalError,
+        MarketError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
@@ -213,6 +251,17 @@ def chat_loop(agent: Agent, mode: str, session_id: str | None) -> int:
                     continue
                 state = agent.resolve(state["id"], decision)
         show(state)
+
+
+def print_market_entries(entries: list[dict], title: str) -> None:
+    print(title + ":")
+    if not entries:
+        print("  none")
+        return
+    for item in entries:
+        revision = str(item.get("revision", ""))[:12]
+        suffix = f" [{revision}]" if revision else ""
+        print(f"  {item['name']} {item['version']}{suffix} — {item['description']}")
 
 
 def entrypoint() -> None:

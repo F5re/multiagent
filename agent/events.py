@@ -29,6 +29,16 @@ def format_event(event: dict) -> str:
     if kind == "mcp_result":
         status = "success" if data.get("ok") else "error"
         return f"[mcp] {data.get('server')}/{data.get('name')}: {status}"
+    if kind == "market_check":
+        return (
+            f"[market] new={len(data.get('new', []))}; "
+            f"updates={len(data.get('updates', []))}; "
+            f"staged={len(data.get('staged', []))}"
+        )
+    if kind == "skill_installed":
+        return f"[market] Installed: {data.get('name')} {data.get('version')}"
+    if kind == "market_error":
+        return f"[market] Error: {data.get('message', 'unknown')}"
     return f"[{kind}] {json.dumps(data, ensure_ascii=False)}"
 
 
