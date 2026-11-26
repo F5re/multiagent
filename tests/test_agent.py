@@ -8,6 +8,7 @@ import pytest
 import agent.engine as engine_module
 from agent.cli import show
 from agent.engine import Agent, AgentError, parse_plan
+from agent.events import format_event
 from agent.model import FakeModel, text_tool_calls
 from agent.policy import Policy, PolicyError
 from agent.storage import StateConflict, Store
@@ -853,3 +854,61 @@ def test_sqlite_conflict_prevents_two_writers(tmp_path: Path) -> None:
     with pytest.raises(StateConflict):
         store.save(second)
     assert store.load("run")["value"] == 1
+
+
+def test_session_events_stats_and_jsonl_export(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session_id = store.create_session("session")
+    state = {
+        "id": "run",
+        "session_id": session_id,
+        "request": "inspect",
+        "usage": {"input_tokens": 12, "output_tokens": 3, "complete": True},
+    }
+    store.create(state)
+    event = store.add_event(
+        session_id,
+        "run",
+        "tool_call",
+        {"name": "read_file", "arguments": {"path": "order.py"}},
+    )
+    store.add_event(
+        session_id,
+        "run",
+        "tool_result",
+        {"name": "read_file", "ok": True},
+    )
+
+    assert set(event) == {"id", "time", "session_id", "run_id", "type", "data"}
+    assert format_event(event) == "[tool] read_file: requested"
+    stats = store.session_stats(session_id)
+    assert stats["runs"] == 1
+    assert stats["tools"] == {"read_file": 1}
+    assert stats["input_tokens"] == 12
+    assert stats["usage_complete"] is True
+
+    output = tmp_path / "events.jsonl"
+    store.export_events(session_id, output)
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["tool_call", "tool_result"]
+
+
+def test_model_usage_is_saved_and_logged(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    answer = plan_reply()
+    answer["_usage"] = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "complete": True,
+    }
+    agent = make_agent(project, [answer])
+
+    state = agent.start("Fix")
+
+    assert state["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "complete": True,
+    }
+    events = agent.store.events(state["session_id"])
+    assert [event["type"] for event in events] == ["run_started", "model_usage"]

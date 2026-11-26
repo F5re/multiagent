@@ -220,6 +220,21 @@ class ChatModel:
         if not isinstance(answer, dict):
             raise ModelError("Model message must be an object")
         if self.ollama_url:
+            answer["_usage"] = {
+                "input_tokens": payload.get("prompt_eval_count"),
+                "output_tokens": payload.get("eval_count"),
+                "complete": isinstance(payload.get("prompt_eval_count"), int)
+                and isinstance(payload.get("eval_count"), int),
+            }
+        else:
+            usage = payload.get("usage", {})
+            answer["_usage"] = {
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+                "complete": isinstance(usage.get("prompt_tokens"), int)
+                and isinstance(usage.get("completion_tokens"), int),
+            }
+        if self.ollama_url:
             content = answer.get("content")
             if isinstance(content, str) and "</think>" in content:
                 answer["content"] = content.rsplit("</think>", 1)[1].strip()

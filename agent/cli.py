@@ -4,9 +4,10 @@ import sys
 from pathlib import Path
 
 from agent.engine import Agent, AgentError
+from agent.events import format_event, format_stats
 from agent.model import ChatModel, ModelError
 from agent.policy import PolicyError
-from agent.storage import StateConflict
+from agent.storage import StateConflict, Store
 
 
 def parser() -> argparse.ArgumentParser:
@@ -21,6 +22,10 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("request")
     run.add_argument("--mode", choices=("safe", "auto"), default="auto")
+    run.add_argument("--session")
+    chat = commands.add_parser("chat")
+    chat.add_argument("--mode", choices=("safe", "auto"), default="auto")
+    chat.add_argument("--session")
     for name in (
         "resume",
         "status",
@@ -33,20 +38,41 @@ def parser() -> argparse.ArgumentParser:
     recovery = commands.add_parser("resolve")
     recovery.add_argument("run_id")
     recovery.add_argument("decision", choices=("retry", "fail", "abort"))
+    commands.add_parser("stats").add_argument("session_id")
+    events = commands.add_parser("events")
+    events.add_argument("session_id")
+    events.add_argument("--jsonl", type=Path)
     return result
 
 
 def main(arguments: list[str] | None = None) -> int:
     arguments_object = parser().parse_args(arguments)
     try:
+        if arguments_object.command in {"stats", "events"}:
+            store = Store(arguments_object.state)
+            if arguments_object.command == "stats":
+                print(format_stats(store.session_stats(arguments_object.session_id)))
+            elif arguments_object.jsonl:
+                store.export_events(arguments_object.session_id, arguments_object.jsonl)
+                print(f"Events exported: {arguments_object.jsonl}")
+            else:
+                for event in store.events(arguments_object.session_id):
+                    print(format_event(event))
+            return 0
         agent = Agent(
             arguments_object.workspace,
             arguments_object.policy,
             arguments_object.state,
             ChatModel(),
         )
+        if arguments_object.command == "chat":
+            return chat_loop(agent, arguments_object.mode, arguments_object.session)
         if arguments_object.command == "run":
-            state = agent.start(arguments_object.request, arguments_object.mode)
+            state = agent.start(
+                arguments_object.request,
+                arguments_object.mode,
+                arguments_object.session,
+            )
         elif arguments_object.command == "resume":
             state = agent.drive(arguments_object.run_id)
         elif arguments_object.command == "status":
@@ -79,10 +105,15 @@ def main(arguments: list[str] | None = None) -> int:
 
 def show(state: dict) -> None:
     print(f"Run: {state['id']}")
+    if state.get("session_id"):
+        print(f"Session: {state['session_id']}")
     print(f"Status: {state['phase']}")
     if state["phase"] == "waiting_plan":
-        print("Plan:")
-        print(json.dumps(state["plan"], ensure_ascii=False, indent=2))
+        print(f"Plan: {state['plan']['goal']}")
+        for index, task in enumerate(state["plan"]["steps"], 1):
+            dependencies = ", ".join(task["depends_on"]) or "none"
+            print(f"  {index}. {task['id']}: {task['description']}")
+            print(f"     tools: {', '.join(task['tools'])}; depends on: {dependencies}")
     if state["phase"] == "waiting_action":
         call = state["calls"][state["queue"][0]]
         print(f"Approval required: {call['name']}")
@@ -99,6 +130,46 @@ def show(state: dict) -> None:
     if state["answer"]:
         print("Result:")
         print(state["answer"])
+
+
+def chat_loop(agent: Agent, mode: str, session_id: str | None) -> int:
+    session_id = agent.store.create_session(session_id)
+    print(f"Session: {session_id}")
+    print("Commands: /stats, /events, /exit")
+    while True:
+        try:
+            request = input("You> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nSession closed.")
+            return 0
+        if not request:
+            continue
+        if request == "/exit":
+            print("Session closed.")
+            return 0
+        if request == "/stats":
+            print(format_stats(agent.store.session_stats(session_id)))
+            continue
+        if request == "/events":
+            for event in agent.store.events(session_id):
+                print(format_event(event))
+            continue
+        state = agent.start(request, mode, session_id)
+        while state["phase"] in {"waiting_plan", "waiting_action", "uncertain"}:
+            show(state)
+            if state["phase"] == "waiting_plan":
+                answer = input("Approve plan? [y/N] ").strip().lower()
+                state = agent.approve_plan(state["id"], answer in {"y", "yes"})
+            elif state["phase"] == "waiting_action":
+                answer = input("Approve action? [y/N] ").strip().lower()
+                state = agent.decide_action(state["id"], answer in {"y", "yes"})
+            else:
+                decision = input("Resolve [retry/fail/abort]: ").strip().lower()
+                if decision not in {"retry", "fail", "abort"}:
+                    print("Choose retry, fail, or abort.")
+                    continue
+                state = agent.resolve(state["id"], decision)
+        show(state)
 
 
 def entrypoint() -> None:

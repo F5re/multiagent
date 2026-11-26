@@ -3,6 +3,7 @@ import json
 import uuid
 from pathlib import Path
 
+from agent.events import format_event
 from agent.policy import Policy
 from agent.storage import Store
 from agent.tools import SCHEMAS, SIDE_EFFECTS, definitions, execute, file_hash, validate
@@ -152,14 +153,24 @@ class Agent:
         self.model = model
         self.after_tool = after_tool
 
-    def start(self, request: str, mode: str = "auto") -> dict:
+    def start(
+        self, request: str, mode: str = "auto", session_id: str | None = None
+    ) -> dict:
         if not request.strip():
             raise ValueError("request must not be empty")
         if mode not in {"safe", "auto"}:
             raise ValueError("mode must be safe or auto")
         run_id = uuid.uuid4().hex
+        session_id = self.store.create_session(session_id)
+        history = self.store.session_runs(session_id)
+        context = [
+            {"request": item["request"], "answer": item.get("answer")}
+            for item in history
+            if item.get("answer")
+        ]
         state = {
             "id": run_id,
+            "session_id": session_id,
             "request": request,
             "mode": mode,
             "phase": "planning",
@@ -176,6 +187,19 @@ class Agent:
                         "and do not edit tests. Answer concisely."
                     ),
                 },
+                *(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Previous conversation in this session: "
+                                + json.dumps(context, ensure_ascii=False)
+                            ),
+                        }
+                    ]
+                    if context
+                    else []
+                ),
                 {"role": "user", "content": request},
                 {
                     "role": "system",
@@ -224,10 +248,16 @@ class Agent:
                 "side_effects": 0,
                 "tool_output_bytes": 0,
             },
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "complete": True,
+            },
             "answer": None,
             "error": None,
         }
         self.store.create(state)
+        self._event(state, "run_started", {"request": request, "mode": mode}, True)
         return self.drive(run_id)
 
     def drive(self, run_id: str) -> dict:
@@ -267,6 +297,7 @@ class Agent:
                         state["phase"] = "failed"
                         state["error"] = "no task has satisfied dependencies"
                         self.store.save(state)
+                        self._event(state, "error", {"message": state["error"]}, True)
                         return state
                     if not state.get("final_prompted"):
                         state["final_prompted"] = True
@@ -306,6 +337,7 @@ class Agent:
         state["phase"] = "failed"
         state["error"] = "agent loop safety limit reached"
         self.store.save(state)
+        self._event(state, "error", {"message": state["error"]}, True)
         return state
 
     def _ask_model(self, state: dict) -> None:
@@ -323,11 +355,44 @@ class Agent:
         except Exception as error:
             state["error"] = f"model request failed: {error}"
             self.store.save(state)
+            self._event(state, "error", {"message": state["error"]}, True)
             return
         if not isinstance(reply, dict):
             state["error"] = "model returned an invalid message"
             self.store.save(state)
             return
+        usage = reply.pop("_usage", None)
+        if isinstance(usage, dict):
+            incoming = usage.get("input_tokens")
+            outgoing = usage.get("output_tokens")
+            if isinstance(incoming, int):
+                state["usage"]["input_tokens"] += incoming
+            else:
+                state["usage"]["complete"] = False
+            if isinstance(outgoing, int):
+                state["usage"]["output_tokens"] += outgoing
+            else:
+                state["usage"]["complete"] = False
+            if not usage.get("complete"):
+                state["usage"]["complete"] = False
+            self._event(
+                state,
+                "model_usage",
+                {
+                    "input_tokens": incoming,
+                    "output_tokens": outgoing,
+                    "complete": bool(usage.get("complete")),
+                },
+                True,
+            )
+        else:
+            state["usage"]["complete"] = False
+            self._event(
+                state,
+                "model_usage",
+                {"input_tokens": None, "output_tokens": None, "complete": False},
+                True,
+            )
         calls = reply.get("tool_calls") or []
         if not isinstance(calls, list):
             state["error"] = "model tool_calls must be an array"
@@ -368,6 +433,7 @@ class Agent:
                     state["phase"] = "failed"
                     state["error"] = f"planning failed after 3 attempts: {error}"
                     self.store.save(state)
+                    self._event(state, "error", {"message": state["error"]}, True)
                     return
                 state["messages"].append(
                     {
@@ -393,6 +459,8 @@ class Agent:
             state["phase"] = "completed"
             state["answer"] = content
         self.store.save(state)
+        if state["phase"] == "completed":
+            self._event(state, "run_finished", {"status": "completed"}, True)
 
     def _retry_task(self, state: dict, task: dict) -> None:
         task["repair_attempts"] = task.get("repair_attempts", 0) + 1
@@ -411,6 +479,8 @@ class Agent:
                 }
             )
         self.store.save(state)
+        if state["phase"] == "failed":
+            self._event(state, "error", {"message": state["error"]}, True)
 
     def _queue_calls(self, state: dict, raw_calls: list[dict]) -> None:
         parsed = []
@@ -481,6 +551,12 @@ class Agent:
                     "result": None,
                     "reserved_output": slot,
                 }
+                self._event(
+                    state,
+                    "tool_call",
+                    {"id": call_id, "name": name, "arguments": arguments},
+                    True,
+                )
             state["queue"].append(call_id)
         self.store.save(state)
 
@@ -563,6 +639,17 @@ class Agent:
         self._request_missing_file(state, call)
         state["queue"].pop(0)
         self.store.save(state)
+        self._event(
+            state,
+            "tool_result",
+            {
+                "id": call["id"],
+                "name": call["name"],
+                "ok": bool(payload.get("ok")),
+                "result": payload,
+            },
+            True,
+        )
 
     @staticmethod
     def _reopen_change_after_failed_tests(
@@ -728,6 +815,7 @@ class Agent:
         if not approved:
             state["phase"] = "rejected"
             self.store.save(state)
+            self._event(state, "approval", {"name": "plan", "approved": False}, True)
             return state
         state["tasks"] = [
             {
@@ -755,6 +843,7 @@ class Agent:
             }
         )
         self.store.save(state)
+        self._event(state, "approval", {"name": "plan", "approved": True}, True)
         return self.drive(run_id)
 
     def decide_action(self, run_id: str, approved: bool) -> dict:
@@ -762,6 +851,12 @@ class Agent:
         if state["phase"] != "waiting_action" or not state["queue"]:
             raise AgentError("run is not waiting for action approval")
         call = state["calls"][state["queue"][0]]
+        self._event(
+            state,
+            "approval",
+            {"name": call["name"], "approved": approved},
+            True,
+        )
         state["phase"] = "running"
         if approved:
             call["status"] = "approved"
@@ -781,6 +876,7 @@ class Agent:
             state["phase"] = "failed"
             state["error"] = "user aborted an uncertain action"
             self.store.save(state)
+            self._event(state, "error", {"message": state["error"]}, True)
             return state
         if decision == "fail":
             state["phase"] = "running"
@@ -813,8 +909,18 @@ class Agent:
         state["phase"] = "budget_exhausted"
         state["error"] = f"{name} budget exhausted"
         self.store.save(state)
+        self._event(state, "error", {"message": state["error"]}, True)
 
     def _protocol_error(self, state: dict, message: str) -> None:
         state["phase"] = "failed"
         state["error"] = "protocol error: " + message
         self.store.save(state)
+        self._event(state, "error", {"message": state["error"]}, True)
+
+    def _event(
+        self, state: dict, event_type: str, data: dict, display: bool = False
+    ) -> dict:
+        event = self.store.add_event(state["session_id"], state["id"], event_type, data)
+        if display:
+            print(format_event(event))
+        return event
