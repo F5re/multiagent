@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError
 from agent.events import format_event, format_stats
 from agent.model import ChatModel, ModelError
@@ -42,16 +43,25 @@ def parser() -> argparse.ArgumentParser:
     events = commands.add_parser("events")
     events.add_argument("session_id")
     events.add_argument("--jsonl", type=Path)
+    doctor = commands.add_parser("doctor")
+    doctor.add_argument("session_id")
+    doctor.add_argument("--json", action="store_true")
     return result
 
 
 def main(arguments: list[str] | None = None) -> int:
     arguments_object = parser().parse_args(arguments)
     try:
-        if arguments_object.command in {"stats", "events"}:
+        if arguments_object.command in {"stats", "events", "doctor"}:
             store = Store(arguments_object.state)
             if arguments_object.command == "stats":
                 print(format_stats(store.session_stats(arguments_object.session_id)))
+            elif arguments_object.command == "doctor":
+                report = analyze_session(store, arguments_object.session_id)
+                if arguments_object.json:
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
+                else:
+                    print(format_report(report))
             elif arguments_object.jsonl:
                 store.export_events(arguments_object.session_id, arguments_object.jsonl)
                 print(f"Events exported: {arguments_object.jsonl}")

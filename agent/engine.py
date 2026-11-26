@@ -338,6 +338,11 @@ class Agent:
                     task["evidence"] = evidence
                     self._announce(task, "completed")
                     self.store.save(state)
+                    self._event(
+                        state,
+                        "task_completed",
+                        {"task_id": task["id"], "evidence": evidence},
+                    )
                     continue
                 if task is None:
                     if not all(
@@ -509,6 +514,11 @@ class Agent:
             task["status"] = "completed"
             task["evidence"] = evidence
             self._announce(task, "completed")
+            self._event(
+                state,
+                "task_completed",
+                {"task_id": task["id"], "evidence": evidence},
+            )
         if all(item["status"] == "completed" for item in state["tasks"]):
             state["phase"] = "completed"
             state["answer"] = content

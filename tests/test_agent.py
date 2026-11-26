@@ -7,6 +7,7 @@ import pytest
 
 import agent.engine as engine_module
 from agent.cli import show
+from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError, parse_plan
 from agent.events import format_event
 from agent.mcp_client import MCPClient, MCPError
@@ -1063,3 +1064,45 @@ def test_agent_exposes_and_logs_mcp_calls(tmp_path: Path) -> None:
     event_types = [event["type"] for event in agent.store.events(state["session_id"])]
     assert "mcp_call" in event_types
     assert "mcp_result" in event_types
+
+
+def test_doctor_finds_repeated_errors_and_unverified_completion(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session = store.create_session("problem")
+    for index in range(2):
+        store.add_event(
+            session,
+            "run",
+            "tool_result",
+            {"name": "Bash", "ok": False, "attempt": index + 1},
+        )
+    store.add_event(session, "run", "run_finished", {"status": "completed"})
+
+    report = analyze_session(store, session)
+
+    assert {item["type"] for item in report["findings"]} == {
+        "repeated_tool_error",
+        "completed_without_verification",
+    }
+    assert all(item["run_id"] == "run" for item in report["findings"])
+    assert all(item["event_ids"] for item in report["findings"])
+    assert "failures" in format_report(report)
+
+
+def test_doctor_does_not_flag_similar_normal_run(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session = store.create_session("normal")
+    store.add_event(session, "run", "tool_result", {"name": "Bash", "ok": False})
+    store.add_event(
+        session,
+        "run",
+        "task_completed",
+        {"task_id": "test", "evidence": {"exit_code": 0}},
+    )
+    store.add_event(session, "run", "run_finished", {"status": "completed"})
+
+    report = analyze_session(store, session)
+
+    assert report["findings"] == []
