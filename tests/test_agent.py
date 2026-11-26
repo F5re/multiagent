@@ -268,6 +268,31 @@ def test_plan_accepts_other_files_and_task_counts() -> None:
     assert len(parse_plan(json.dumps(four_tasks))["steps"]) == 4
 
 
+def test_plan_normalizes_mcp_task_to_verifiable_result() -> None:
+    plan = {
+        "goal": "Read issue",
+        "steps": [
+            {
+                "id": "issue",
+                "description": "Read issue through MCP",
+                "depends_on": [],
+                "tools": ["mcp__project_tracker__get_issue"],
+                "verification": {"kind": "read_files", "paths": []},
+            }
+        ],
+        "risks": [],
+        "assumptions": [],
+        "done_when": "Issue was returned",
+    }
+
+    parsed = parse_plan(json.dumps(plan), {"mcp__project_tracker__get_issue"})
+
+    assert parsed["steps"][0]["verification"] == {
+        "kind": "mcp_succeeded",
+        "tool": "mcp__project_tracker__get_issue",
+    }
+
+
 def test_plan_rejects_file_change_after_tests_pass() -> None:
     plan = json.loads(plan_reply()["content"])
     plan["steps"][1]["depends_on"] = ["verify"]
@@ -566,6 +591,46 @@ def test_agent_cannot_finish_test_task_without_model_bash_call(tmp_path: Path) -
     assert failed["error"] == "task verify has no verified result"
     assert all(item["name"] != "Bash" for item in failed["calls"].values())
     assert failed["tasks"][-1]["evidence"] is None
+
+
+def test_rejected_bash_gets_exact_feedback_but_model_must_call_it(
+    tmp_path: Path,
+) -> None:
+    project = make_project(tmp_path)
+    agent = make_agent(
+        project,
+        [
+            plan_reply(),
+            tool_reply(
+                call("source", "read_file", path="order.py"),
+                call("tests", "read_file", path="test_order.py"),
+            ),
+            tool_reply(call("write", "write_file", path="order.py", content=FIXED)),
+            tool_reply(call("bad_bash", "Bash", command="python3 -m unittest -v")),
+            tool_reply(
+                call(
+                    "good_bash",
+                    "Bash",
+                    command="python3 -m unittest -v",
+                    cwd=".",
+                )
+            ),
+            final("Passed."),
+        ],
+    )
+
+    waiting = agent.start("Fix")
+    completed = agent.approve_plan(waiting["id"], True)
+
+    assert completed["phase"] == "completed"
+    assert json.loads(completed["calls"]["bad_bash"]["result"])["ok"] is False
+    assert completed["tasks"][-1]["evidence"]["tool_call_id"] == "good_bash"
+    feedback = [
+        message["content"]
+        for message in completed["messages"]
+        if message["role"] == "user" and "exactly these arguments" in message["content"]
+    ]
+    assert '"cwd": "."' in feedback[0]
 
 
 def test_safe_mode_waits_for_write_and_bash_approval(tmp_path: Path) -> None:
@@ -900,6 +965,46 @@ def test_session_events_stats_and_jsonl_export(tmp_path: Path) -> None:
     assert [row["type"] for row in rows] == ["tool_call", "tool_result"]
 
 
+def test_next_run_receives_previous_session_context(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = make_agent(
+        project,
+        [
+            plan_reply(),
+            tool_reply(
+                call("source", "read_file", path="order.py"),
+                call("tests", "read_file", path="test_order.py"),
+            ),
+            tool_reply(call("write", "write_file", path="order.py", content=FIXED)),
+            tool_reply(
+                call(
+                    "bash",
+                    "Bash",
+                    command="python3 -m unittest -v",
+                    cwd=".",
+                )
+            ),
+            final("The calculation was fixed."),
+            plan_reply(),
+        ],
+    )
+
+    first = agent.start("Fix calculation", session_id="conversation")
+    completed = agent.approve_plan(first["id"], True)
+    second = agent.start("Now explain the change", session_id="conversation")
+
+    assert completed["phase"] == "completed"
+    assert second["session_id"] == completed["session_id"]
+    previous = [
+        message["content"]
+        for message in second["messages"]
+        if message["role"] == "system"
+        and message["content"].startswith("Previous conversation")
+    ]
+    assert "Fix calculation" in previous[0]
+    assert "The calculation was fixed." in previous[0]
+
+
 def test_model_usage_is_saved_and_logged(tmp_path: Path) -> None:
     project = make_project(tmp_path)
     answer = plan_reply()
@@ -991,6 +1096,32 @@ def test_skills_can_be_disabled_for_variant_a(tmp_path: Path) -> None:
     assert "load_skill" not in {
         tool["function"]["name"] for tool in agent.model.requests[0][1]
     }
+
+
+def test_model_can_explicitly_choose_no_skill(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(ROOT / "skills" / "release-notes", skills / "release-notes")
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel([final("NO_SKILL"), plan_reply()]),
+    )
+
+    state = agent.start("Fix code")
+
+    assert state["phase"] == "waiting_plan"
+    assert state["loaded_skills"] == {}
+    assert {tool["function"]["name"] for tool in agent.model.requests[0][1]} == {
+        "load_skill"
+    }
+    routing = [
+        event
+        for event in agent.store.events(state["session_id"])
+        if event["type"] == "skill_routing"
+    ]
+    assert routing[0]["data"] == {"selected": []}
 
 
 def test_mcp_discovers_and_calls_configured_tool() -> None:
@@ -1092,6 +1223,7 @@ def test_doctor_finds_repeated_errors_and_unverified_completion(
     assert all(item["run_id"] == "run" for item in report["findings"])
     assert all(item["event_ids"] for item in report["findings"])
     assert "failures" in format_report(report)
+    assert "Tools:" in format_report(report)
 
 
 def test_doctor_does_not_flag_similar_normal_run(tmp_path: Path) -> None:
@@ -1179,6 +1311,9 @@ def test_eval_runner_restores_trials_checks_results_and_resumes(
     assert all(item["outcome_pass"] for item in first)
     assert {item["variant"] for item in first} == {"A", "B"}
     assert (tmp_path / "results" / "summary.md").is_file()
+    summary = (tmp_path / "results" / "summary.md").read_text()
+    assert "routing errors:" in summary
+    assert "usage complete:" in summary
     assert len((tmp_path / "results" / "results.jsonl").read_text().splitlines()) == 2
 
 

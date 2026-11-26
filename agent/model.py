@@ -33,6 +33,7 @@ PLAN_FORMAT = {
                                     "file_deleted",
                                     "tests_pass",
                                     "skill_installed",
+                                    "mcp_succeeded",
                                 ]
                             },
                             "paths": {
@@ -42,6 +43,7 @@ PLAN_FORMAT = {
                             "path": {"type": "string"},
                             "command": {"type": "string"},
                             "name": {"type": "string"},
+                            "tool": {"type": "string"},
                         },
                         "required": ["kind"],
                         "additionalProperties": False,

@@ -22,7 +22,17 @@ VERIFY_TOOL = {
     "file_deleted": "delete_file",
     "tests_pass": "Bash",
     "skill_installed": "install_skill",
+    "mcp_succeeded": None,
 }
+
+
+def required_tool(proof: dict) -> str:
+    if proof["kind"] == "mcp_succeeded":
+        return proof["tool"]
+    value = VERIFY_TOOL[proof["kind"]]
+    if not isinstance(value, str):
+        raise AgentError("verification tool is invalid")
+    return value
 
 
 def parse_plan(text: str, available_tools: set[str] | None = None) -> dict:
@@ -84,6 +94,15 @@ def parse_plan(text: str, available_tools: set[str] | None = None) -> dict:
                 f"task {task_id} contains unknown tools: {', '.join(unknown_tools)}"
             )
         proof = step["verification"]
+        mcp_tools = [item for item in tools if item.startswith("mcp__")]
+        if (
+            isinstance(proof, dict)
+            and proof.get("kind") == "read_files"
+            and proof.get("paths") == []
+            and len(mcp_tools) == 1
+        ):
+            proof.clear()
+            proof.update({"kind": "mcp_succeeded", "tool": mcp_tools[0]})
         if not isinstance(proof, dict) or proof.get("kind") not in VERIFY_TOOL:
             raise AgentError("task verification is invalid")
         kind = proof["kind"]
@@ -94,6 +113,8 @@ def parse_plan(text: str, available_tools: set[str] | None = None) -> dict:
             if kind == "tests_pass"
             else "name"
             if kind == "skill_installed"
+            else "tool"
+            if kind == "mcp_succeeded"
             else "path"
         )
         if set(proof) != {"kind", key}:
@@ -108,10 +129,9 @@ def parse_plan(text: str, available_tools: set[str] | None = None) -> dict:
                 raise AgentError("read_files requires paths")
         elif not isinstance(value, str) or not value:
             raise AgentError(f"{kind} requires {key}")
-        if VERIFY_TOOL[kind] not in tools:
-            raise AgentError(
-                f"task {task_id} verification requires {VERIFY_TOOL[kind]}"
-            )
+        required = required_tool(proof)
+        if required not in tools:
+            raise AgentError(f"task {task_id} verification requires {required}")
         known.add(task_id)
     dependencies = {step["id"]: set(step["depends_on"]) for step in steps}
     if any(task_id in required for task_id, required in dependencies.items()):
@@ -282,11 +302,28 @@ class Agent:
                         '{"kind":"file_deleted","path":"old.py"}, '
                         "requires delete_file in tools; "
                         '{"kind":"tests_pass","command":"python3 -m unittest -v"} '
-                        "requires Bash in tools. "
+                        "requires Bash in tools; "
+                        '{"kind":"mcp_succeeded","tool":"mcp__server__name"} '
+                        "verifies a successful MCP call. "
                         "Use exact tool names: list_files, read_file, write_file, "
                         "delete_file, Bash."
                     ),
                 },
+                *(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "SKILL ROUTING MODE. Do not return a plan yet. "
+                                "Decide from the catalog whether one skill is "
+                                "relevant. Call load_skill for one relevant skill, "
+                                "or reply with exactly NO_SKILL when none applies."
+                            ),
+                        }
+                    ]
+                    if self.skills.catalog()
+                    else []
+                ),
             ],
             "limits": {
                 key: self.policy.limits[key]
@@ -309,6 +346,8 @@ class Agent:
                 "complete": True,
             },
             "loaded_skills": {},
+            "routing_done": not bool(self.skills.catalog()),
+            "routing_errors": 0,
             "answer": None,
             "error": None,
         }
@@ -399,7 +438,7 @@ class Agent:
                                 f"Current task {task['id']}: {task['description']}. "
                                 "Required evidence: "
                                 f"{json.dumps(task['verification'])}. "
-                                f"Call {VERIFY_TOOL[task['verification']['kind']]} "
+                                f"Call {required_tool(task['verification'])} "
                                 "using tool_calls and finish only after evidence "
                                 "exists. Do not print a tool call as text."
                             ),
@@ -417,6 +456,23 @@ class Agent:
         return state
 
     def _ask_model(self, state: dict) -> None:
+        routing = state["phase"] == "planning" and not state.get("routing_done", True)
+        if routing and state.get("loaded_skills"):
+            state["routing_done"] = True
+            routing = False
+            self._event(
+                state,
+                "skill_routing",
+                {"selected": sorted(state["loaded_skills"])},
+                True,
+            )
+            state["messages"].append(
+                {
+                    "role": "system",
+                    "content": "Skill routing is complete. Now return the JSON plan.",
+                }
+            )
+            self.store.save(state)
         if state["used"]["model_requests"] >= state["limits"]["model_requests"]:
             self._budget_error(state, "model_requests")
             return
@@ -437,8 +493,14 @@ class Agent:
                 if tool["function"]["name"] not in {"search_market", "install_skill"}
             ]
         offered.extend(self.mcp.definitions(planning, permitted))
+        if routing:
+            offered = [
+                tool for tool in offered if tool["function"]["name"] == "load_skill"
+            ]
         try:
-            reply = self.model.complete(state["messages"], offered, planning)
+            reply = self.model.complete(
+                state["messages"], offered, planning and not routing
+            )
         except Exception as error:
             state["error"] = f"model request failed: {error}"
             self.store.save(state)
@@ -511,6 +573,37 @@ class Agent:
                 )
                 self.store.save(state)
             return
+        if routing:
+            if content.strip().upper() == "NO_SKILL":
+                state["routing_done"] = True
+                state["messages"].append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "No skill was selected. Skill routing is complete. "
+                            "Now return the JSON plan."
+                        ),
+                    }
+                )
+                self._event(state, "skill_routing", {"selected": []}, True)
+            else:
+                state["routing_errors"] += 1
+                if state["routing_errors"] >= 3:
+                    state["phase"] = "failed"
+                    state["error"] = "skill routing failed after 3 attempts"
+                    self._event(state, "error", {"message": state["error"]}, True)
+                else:
+                    state["messages"].append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Do not return a plan yet. Call load_skill for a "
+                                "relevant catalog skill, or reply exactly NO_SKILL."
+                            ),
+                        }
+                    )
+            self.store.save(state)
+            return
         if planning:
             try:
                 state["plan"] = parse_plan(content, self.mcp.names())
@@ -560,7 +653,7 @@ class Agent:
             state["phase"] = "failed"
             state["error"] = f"task {task['id']} has no verified result"
         else:
-            required = VERIFY_TOOL[task["verification"]["kind"]]
+            required = required_tool(task["verification"])
             state["messages"].append(
                 {
                     "role": "user",
@@ -781,6 +874,7 @@ class Agent:
         )
         self._reopen_change_after_failed_tests(state, call, payload)
         self._request_missing_file(state, call)
+        self._request_correct_arguments(state, call, payload)
         state["queue"].pop(0)
         self.store.save(state)
         self._event(
@@ -875,6 +969,32 @@ class Agent:
                 }
             )
 
+    @staticmethod
+    def _request_correct_arguments(state: dict, call: dict, payload: dict) -> None:
+        if payload.get("ok") or call["name"] != "Bash":
+            return
+        task = next(
+            (item for item in state["tasks"] if item["id"] == call["task_id"]),
+            None,
+        )
+        if not task or task["verification"]["kind"] != "tests_pass":
+            return
+        expected = {
+            "command": task["verification"]["command"],
+            "cwd": ".",
+        }
+        state["messages"].append(
+            {
+                "role": "user",
+                "content": (
+                    "The Bash call was rejected. Call Bash yourself again with "
+                    "exactly these arguments: "
+                    + json.dumps(expected)
+                    + ". Do not change the command and do not describe the call."
+                ),
+            }
+        )
+
     def _append_cached(self, state: dict, call: dict) -> None:
         state["messages"].append(
             {"role": "tool", "tool_call_id": call["id"], "content": call["result"]}
@@ -957,6 +1077,10 @@ class Agent:
                     and self.market.installed(proof["name"])
                 ):
                     return {"tool_call_id": call["id"], "installed": True}
+        if kind == "mcp_succeeded":
+            for call, _ in calls:
+                if call["name"] == proof["tool"]:
+                    return {"tool_call_id": call["id"], "tool": proof["tool"]}
         return None
 
     @staticmethod

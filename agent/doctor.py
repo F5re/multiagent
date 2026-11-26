@@ -6,6 +6,7 @@ from agent.storage import Store
 
 def analyze_session(store: Store, session_id: str) -> dict:
     events = store.events(session_id)
+    stats = store.session_stats(session_id)
     findings = []
     by_run: dict[str, list[dict]] = {}
     for event in events:
@@ -69,6 +70,7 @@ def analyze_session(store: Store, session_id: str) -> dict:
     return {
         "session_id": session_id,
         "events_analyzed": len(events),
+        "stats": stats,
         "findings": findings,
         "limitations": [] if events else ["No events are available for this session."],
     }
@@ -94,9 +96,19 @@ def finding(
 
 
 def format_report(report: dict) -> str:
+    stats = report["stats"]
+    usage = (
+        f"input={stats['input_tokens']}; output={stats['output_tokens']}"
+        if stats["usage_complete"]
+        else "unknown or incomplete"
+    )
     lines = [
         f"Doctor: session {report['session_id']}",
         f"Events analyzed: {report['events_analyzed']}",
+        f"Runs: {stats['runs']}; tokens: {usage}",
+        f"Skills: {stats['skills'] or 'none'}",
+        f"Tools: {stats['tools'] or 'none'}",
+        f"MCP calls: {stats['mcp'] or 'none'}",
     ]
     if not report["findings"]:
         lines.append("Findings: none")

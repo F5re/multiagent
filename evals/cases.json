@@ -1,7 +1,7 @@
 [
   {
     "id": "fix-failing-test",
-    "request": "Use project_tracker get_issue for ISSUE-1. Fix order.py so test_order.py passes without changing the test, then run python3 -m unittest -v. Plan tasks in the order inspect, change, test.",
+    "request": "Before returning the JSON plan, call project_tracker get_issue for ISSUE-1. Then fix order.py without changing test_order.py. The plan must contain exactly: inspect with read_file and read_files verification for order.py and test_order.py; change with write_file and file_changed verification for order.py; test with Bash and tests_pass verification for python3 -m unittest -v. Dependencies are inspect -> change -> test.",
     "fixture": "evals/fixtures/fix-failing-test",
     "checker": "order_tests",
     "expected_skill": "investigate-test-failure",
@@ -9,7 +9,7 @@
   },
   {
     "id": "python-review",
-    "request": "Review calculator.py and save review.md with the headings Correctness, Safety, Maintainability, and Tests. Do not modify calculator.py.",
+    "request": "Review calculator.py and save review.md with the headings Correctness, Safety, Maintainability, and Tests. Do not modify calculator.py. Plan exactly two tasks: inspect uses read_file with read_files verification for calculator.py; report depends on inspect and uses write_file with file_changed verification for review.md.",
     "fixture": "evals/fixtures/python-review",
     "checker": "review_report",
     "expected_skill": "python-code-review",
@@ -17,7 +17,7 @@
   },
   {
     "id": "no-matching-skill",
-    "request": "Read tasks.json and save ids.json as a JSON array containing the IDs of open tasks only.",
+    "request": "Read tasks.json and save ids.json as a JSON array containing the IDs of open tasks only. Plan exactly two tasks: read uses read_file with read_files verification for tasks.json; write depends on read and uses write_file with file_changed verification for ids.json.",
     "fixture": "evals/fixtures/no-matching-skill",
     "checker": "json_ids",
     "expected_skill": null,
@@ -25,7 +25,7 @@
   },
   {
     "id": "missing-data",
-    "request": "Read missing.json and save its summary to summary.json. Do not invent values if the source is unavailable.",
+    "request": "Read missing.json and save its summary to summary.json. Do not invent values if the source is unavailable. Start with a read task using read_file and read_files verification for missing.json.",
     "fixture": "evals/fixtures/missing-data",
     "checker": "missing_data",
     "expected_skill": null,
@@ -33,7 +33,7 @@
   },
   {
     "id": "mcp-failure",
-    "request": "Use project_tracker get_issue with issue_id ERROR and save issue-report.json only if real issue data is returned. Never invent tracker data.",
+    "request": "Before returning a plan, call project_tracker get_issue with issue_id ERROR. Save issue-report.json only if real issue data is returned. Never invent tracker data; if MCP fails, leave the output absent and report the limitation.",
     "fixture": "evals/fixtures/mcp-failure",
     "checker": "mcp_failure",
     "expected_skill": null,

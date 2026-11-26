@@ -24,6 +24,9 @@ def format_event(event: dict) -> str:
         return f"[error] {data.get('message', 'unknown error')}"
     if kind == "skill_loaded":
         return f"[skill] Loaded: {data.get('name', 'unknown')}"
+    if kind == "skill_routing":
+        selected = ", ".join(data.get("selected", [])) or "none"
+        return f"[skill] Routing decision: {selected}"
     if kind == "mcp_call":
         return f"[mcp] {data.get('server')}/{data.get('name')}: requested"
     if kind == "mcp_result":

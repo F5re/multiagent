@@ -170,7 +170,11 @@ class EvalRunner:
             for variant, values in variants.items():
                 lines.append(
                     f"- {variant}: {values['passed']}/{values['trials']} passed; "
-                    f"average tokens: {values['average_tokens']}"
+                    f"routing errors: {values['routing_errors']}; "
+                    f"average tokens: {values['average_tokens']}; "
+                    f"usage complete: {values['usage_complete']}/"
+                    f"{values['trials']}; MCP calls: {values['mcp_calls']}; "
+                    f"errors: {values['errors']}; tools: {values['tool_calls']}"
                 )
             lines.append("")
         lines.extend(["## Trials", ""])
@@ -231,10 +235,26 @@ def summarize(results: list[dict]) -> dict:
     cases: dict[str, dict] = {}
     for item in results:
         values = cases.setdefault(item["case_id"], {}).setdefault(
-            item["variant"], {"trials": 0, "passed": 0, "tokens": []}
+            item["variant"],
+            {
+                "trials": 0,
+                "passed": 0,
+                "routing_errors": 0,
+                "usage_complete": 0,
+                "mcp_calls": 0,
+                "errors": 0,
+                "tool_calls": {},
+                "tokens": [],
+            },
         )
         values["trials"] += 1
         values["passed"] += int(item["outcome_pass"])
+        values["routing_errors"] += int(item["routing_pass_or_na"] is False)
+        values["usage_complete"] += int(item.get("usage_complete") is True)
+        values["mcp_calls"] += int(item.get("mcp_calls", 0))
+        values["errors"] += int(bool(item.get("error")))
+        for name in item.get("tool_calls", []):
+            values["tool_calls"][name] = values["tool_calls"].get(name, 0) + 1
         if isinstance(item.get("input_tokens"), int) and isinstance(
             item.get("output_tokens"), int
         ):
