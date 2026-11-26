@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError
+from agent.evals import EvalError, EvalRunner
 from agent.events import format_event, format_stats
 from agent.model import ChatModel, ModelError
 from agent.policy import PolicyError
@@ -46,12 +47,43 @@ def parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor")
     doctor.add_argument("session_id")
     doctor.add_argument("--json", action="store_true")
+    evaluation = commands.add_parser("eval")
+    evaluation_commands = evaluation.add_subparsers(dest="eval_command", required=True)
+    evaluation_run = evaluation_commands.add_parser("run")
+    evaluation_run.add_argument("--trials", type=int, default=3)
+    evaluation_run.add_argument(
+        "--cases", type=Path, default=root / "evals" / "cases.json"
+    )
+    evaluation_run.add_argument(
+        "--output", type=Path, default=root / "results" / "baseline"
+    )
+    evaluation_commands.add_parser("summary").add_argument(
+        "--output", type=Path, default=root / "results" / "baseline"
+    )
     return result
 
 
 def main(arguments: list[str] | None = None) -> int:
     arguments_object = parser().parse_args(arguments)
     try:
+        if arguments_object.command == "eval":
+            runner = EvalRunner(
+                Path(__file__).resolve().parent.parent,
+                getattr(
+                    arguments_object,
+                    "cases",
+                    Path(__file__).resolve().parent.parent / "evals" / "cases.json",
+                ),
+                arguments_object.output,
+            )
+            if arguments_object.eval_command == "run":
+                results = runner.run(arguments_object.trials)
+                print(f"Eval trials saved: {len(results)}")
+            else:
+                results = runner.read_results()
+                runner.write_summary(results)
+                print(f"Summary written: {arguments_object.output / 'summary.md'}")
+            return 0
         if arguments_object.command in {"stats", "events", "doctor"}:
             store = Store(arguments_object.state)
             if arguments_object.command == "stats":
@@ -108,6 +140,7 @@ def main(arguments: list[str] | None = None) -> int:
         StateConflict,
         KeyError,
         ValueError,
+        EvalError,
     ) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2

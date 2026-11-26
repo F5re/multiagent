@@ -9,6 +9,7 @@ import agent.engine as engine_module
 from agent.cli import show
 from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError, parse_plan
+from agent.evals import EvalRunner
 from agent.events import format_event
 from agent.mcp_client import MCPClient, MCPError
 from agent.model import FakeModel, text_tool_calls
@@ -1106,3 +1107,74 @@ def test_doctor_does_not_flag_similar_normal_run(tmp_path: Path) -> None:
     report = analyze_session(store, session)
 
     assert report["findings"] == []
+
+
+def test_eval_runner_restores_trials_checks_results_and_resumes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config").mkdir()
+    shutil.copy(ROOT / "config" / "policy.json", tmp_path / "config" / "policy.json")
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "tasks.json").write_text(
+        '[{"id":"T1","status":"open"},{"id":"T3","status":"open"}]',
+        encoding="utf-8",
+    )
+    cases = [
+        {
+            "id": "ids",
+            "request": "Create ids.json",
+            "fixture": "fixture",
+            "checker": "json_ids",
+            "expected_skill": None,
+            "required_tools": ["write_file"],
+        }
+    ]
+    cases_file = tmp_path / "cases.json"
+    cases_file.write_text(json.dumps(cases), encoding="utf-8")
+    plan = {
+        "goal": "Create IDs",
+        "steps": [
+            {
+                "id": "read",
+                "description": "Read tasks",
+                "depends_on": [],
+                "tools": ["read_file"],
+                "verification": {"kind": "read_files", "paths": ["tasks.json"]},
+            },
+            {
+                "id": "write",
+                "description": "Write IDs",
+                "depends_on": ["read"],
+                "tools": ["write_file"],
+                "verification": {"kind": "file_changed", "path": "ids.json"},
+            },
+        ],
+        "risks": [],
+        "assumptions": [],
+        "done_when": "ids.json exists",
+    }
+
+    def model_factory() -> FakeModel:
+        return FakeModel(
+            [
+                final(json.dumps(plan)),
+                tool_reply(call("read", "read_file", path="tasks.json")),
+                tool_reply(
+                    call("write", "write_file", path="ids.json", content='["T1","T3"]')
+                ),
+                final("Created IDs."),
+            ]
+        )
+
+    runner = EvalRunner(
+        tmp_path, cases_file, tmp_path / "results", model_factory=model_factory
+    )
+    first = runner.run(trials=1)
+    second = runner.run(trials=1)
+
+    assert len(first) == len(second) == 2
+    assert all(item["outcome_pass"] for item in first)
+    assert {item["variant"] for item in first} == {"A", "B"}
+    assert (tmp_path / "results" / "summary.md").is_file()
+    assert len((tmp_path / "results" / "results.jsonl").read_text().splitlines()) == 2
