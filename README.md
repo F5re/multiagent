@@ -50,6 +50,7 @@
 | Автоматическое решение | [`results/update/investigate-test-failure/decision.json`](results/update/investigate-test-failure/decision.json) |
 | Событие решения об обновлении | [`results/update/events.jsonl`](results/update/events.jsonl) |
 | Проверки принятия, отклонения и rollback | [`tests/test_agent.py`](tests/test_agent.py): `test_update_decision_accepts_only_non_regressing_complete_results`, `test_skill_update_applies_atomically_and_rolls_back` |
+| Скриншоты интерактивной работы | [`docs/screenshots`](docs/screenshots) |
 
 Сохранённые результаты, JSONL и тесты читаются без Ollama и без API-ключа. Модель нужна только для нового реального запуска.
 
@@ -272,14 +273,75 @@ cat results/update/investigate-test-failure/decision.json
 
 ## Скриншоты интерактивной работы
 
-Перед сдачей нужно добавить в `docs/screenshots` четыре изображения из уже записанного терминального чата:
+Скриншоты сгруппированы по накопительным уровням задания. Отдельный скрин обычного `read_file`/`write_file`/Bash не приводится: эти инструменты относятся к первой домашней работе, а здесь показаны новые требования.
 
-1. `01-agent-run.png` — выбор `investigate-test-failure`, утверждённый план, `read_file`, `write_file`, ошибка первого Bash, успешный повтор и `Status: completed`.
-2. `02-follow-up.png` — второй запрос в той же сессии, выбор `python-code-review` и создание `explanation.md`.
-3. `03-session-stats-events.png` — команды `/stats` и `/events`, где видны два run, токены, Skills и инструменты.
-4. `04-mcp-doctor-market.png` — успешный и ошибочный MCP-вызовы, вывод Doctor и `market check` с новой версией и новым Skill.
+### Уровень 4 — интерактивная сессия, Skills, журнал и статистика
 
-На изображениях не должно быть `.env`, API-ключей, лишних вкладок или личных данных. Если один кадр получается слишком длинным, лучше сделать пять коротких изображений, чем один нечитаемый.
+Модель получила метаданные каталога, сама выбрала `investigate-test-failure`, загрузила полный Skill, построила план и дождалась подтверждения пользователя:
+
+![Уровень 4 — выбор Skill и Plan Mode](docs/screenshots/level-4-skill-plan.png)
+
+Связанное уточнение выполнено в той же сессии. Для другой задачи модель самостоятельно выбрала второй Skill — `python-code-review`:
+
+![Уровень 4 — связанное уточнение и второй Skill](docs/screenshots/level-4-follow-up.png)
+
+Команда `/stats` показывает число run и событий, реальные input/output tokens, частоту и число уникальных Skills и tools:
+
+![Уровень 4 — статистика сессии](docs/screenshots/level-4-session-stats.png)
+
+Команда `/events` восстанавливает ход работы: обнаружение и загрузку Skills, usage, подтверждение плана, вызовы инструментов и подтверждённые результаты задач. Полная машиночитаемая версия этой сессии приложена в [`results/live-session-events.jsonl`](results/live-session-events.jsonl).
+
+![Уровень 4 — журнал событий](docs/screenshots/level-4-event-journal.png)
+
+### Уровень 5 — MCP
+
+Код собственного MCP-сервера, данные и конфигурация приложены в [`mcp_servers/project_tracker.py`](mcp_servers/project_tracker.py), [`mcp_servers/issues.json`](mcp_servers/issues.json) и [`config/mcp.json`](config/mcp.json). Положительный вызов, ошибка, timeout и запрет policy проверяются тестами:
+
+```bash
+.venv/bin/pytest -vv -k 'mcp_discovers_and_calls_configured_tool or mcp_error_and_timeout_are_clear or mcp_policy_can_deny_an_available_tool or agent_exposes_and_logs_mcp_calls'
+```
+
+Отдельный скрин уровня 5 ещё нужно добавить как `docs/screenshots/level-5-mcp.png`: на одном кадре должны быть видны `project_tracker/get_issue: success` и контролируемый `project_tracker/get_issue: error`.
+
+### Уровень 6 — Doctor
+
+Doctor разобрал реальную сессию: показал токены, частоты Skill/tool/MCP, два ID проблемных событий, интерпретацию повторной ошибки и конкретную рекомендацию:
+
+![Уровень 6 — Doctor](docs/screenshots/level-6-doctor.png)
+
+### Уровень 7 — eval одной командой
+
+Eval запускается одной командой, восстанавливает fixtures, создаёт новую сессию и run для каждого trial, выполняет программную проверку и строит сводку. Итоговая серия содержит 5 сценариев × A/B × 3 повтора = 30 trials. Результаты приложены в [`results/baseline`](results/baseline).
+
+Отдельный скрин уровня 7 ещё нужно добавить как `docs/screenshots/level-7-eval-summary.png`. На одном кадре достаточно показать:
+
+```bash
+wc -l results/baseline/results.jsonl
+find results/baseline -name events.jsonl | wc -l
+sed -n '1,35p' results/baseline/summary.md
+```
+
+Оба счётчика должны показать `30`, ниже должна быть видна таблица A/B с успешностью, routing, токенами, MCP и tools.
+
+### Уровень 8 — market
+
+Принудительная проверка market обнаружила новый `security-review`, намеренно некорректный `broken-skill` и версию 2.0 установленного `investigate-test-failure`. Ревизии показаны рядом с версиями. Первая и вторая версии market лежат в [`marketplace/version_1`](marketplace/version_1) и [`marketplace/version_2`](marketplace/version_2), события — в [`results/market/events.jsonl`](results/market/events.jsonl).
+
+![Уровень 8 — обнаружение новинок и обновления](docs/screenshots/level-8-market.png)
+
+### Уровень 9 — eval-gated update и rollback
+
+На реальной LLM выполнено 30 old/new trials. Кандидат 2.0 автоматически отклонён: routing прошёл не во всех сценариях и провален обязательный limitation-сценарий. Старая версия 1.0 осталась активной; решение и причины сохранены в [`decision.json`](results/update/investigate-test-failure/decision.json).
+
+![Уровень 9 — автоматическое решение](docs/screenshots/level-9-update-decision.png)
+
+Ветки принятия, отклонения, атомарного применения и rollback дополнительно доказаны детерминированными тестами:
+
+```bash
+.venv/bin/pytest -vv -k 'update_decision_accepts_only_non_regressing_complete_results or skill_update_applies_atomically_and_rolls_back'
+```
+
+При желании можно добавить ещё один кадр `docs/screenshots/level-9-rollback-tests.png` с двумя прошедшими тестами, но он необязателен: реальное решение уже показано выше, а тесты и их код приложены.
 
 ## Ограничения
 
