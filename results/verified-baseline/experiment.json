@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-27",
+  "model": "qwen3.5:9b",
+  "mode": "auto; plans and requested actions approved uniformly",
+  "checker_version": 2,
+  "cases": 5,
+  "variants": {
+    "A": "skills disabled",
+    "B": "skills enabled"
+  },
+  "trials_per_case_and_variant": 3,
+  "total_trials": 30,
+  "policy": "config/policy.json",
+  "mcp": "config/mcp.json",
+  "fixtures": "evals/fixtures",
+  "hypothesis": "Relevant Skills improve task success without harming unrelated cases.",
+  "conclusion": "Mixed result: B improved no-matching-skill from 1/3 to 3/3 but reduced fix-failing-test from 3/3 to 1/3; the hypothesis is not supported in this series."
+}

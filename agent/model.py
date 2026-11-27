@@ -21,15 +21,7 @@ PLAN_FORMAT = {
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                     "tools": {
                         "type": "array",
-                        "items": {
-                            "enum": [
-                                "Bash",
-                                "list_files",
-                                "read_file",
-                                "write_file",
-                                "delete_file",
-                            ]
-                        },
+                        "items": {"type": "string"},
                     },
                     "verification": {
                         "type": "object",
@@ -40,6 +32,8 @@ PLAN_FORMAT = {
                                     "file_changed",
                                     "file_deleted",
                                     "tests_pass",
+                                    "skill_installed",
+                                    "mcp_succeeded",
                                 ]
                             },
                             "paths": {
@@ -48,6 +42,8 @@ PLAN_FORMAT = {
                             },
                             "path": {"type": "string"},
                             "command": {"type": "string"},
+                            "name": {"type": "string"},
+                            "tool": {"type": "string"},
                         },
                         "required": ["kind"],
                         "additionalProperties": False,
@@ -219,6 +215,21 @@ class ChatModel:
             raise ModelError("Model API returned an invalid response") from error
         if not isinstance(answer, dict):
             raise ModelError("Model message must be an object")
+        if self.ollama_url:
+            answer["_usage"] = {
+                "input_tokens": payload.get("prompt_eval_count"),
+                "output_tokens": payload.get("eval_count"),
+                "complete": isinstance(payload.get("prompt_eval_count"), int)
+                and isinstance(payload.get("eval_count"), int),
+            }
+        else:
+            usage = payload.get("usage", {})
+            answer["_usage"] = {
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+                "complete": isinstance(usage.get("prompt_tokens"), int)
+                and isinstance(usage.get("completion_tokens"), int),
+            }
         if self.ollama_url:
             content = answer.get("content")
             if isinstance(content, str) and "</think>" in content:

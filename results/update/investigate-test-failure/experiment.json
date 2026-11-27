@@ -1,0 +1,14 @@
+{
+  "date": "2026-11-26",
+  "model": "qwen3.5:9b",
+  "cases": 5,
+  "variants": ["old", "new"],
+  "trials_per_case_and_variant": 3,
+  "total_trials": 30,
+  "old_version": "1.0.0",
+  "new_version": "2.0.0",
+  "both_variants_have_skills_enabled": true,
+  "only_target_skill_version_differs": true,
+  "decision": "rejected",
+  "reason": "The candidate did not pass routing in every scenario and failed a required limitation scenario."
+}

@@ -1,5 +1,7 @@
 .env
 .agent_state/
+demo-workspace/
+results/**/state.sqlite3
 state/
 .venv/
 .idea/

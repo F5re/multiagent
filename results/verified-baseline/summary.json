@@ -1,0 +1,150 @@
+{
+  "trials": 30,
+  "cases": {
+    "fix-failing-test": {
+      "A": {
+        "trials": 3,
+        "passed": 3,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 3,
+        "errors": 0,
+        "tool_calls": {
+          "read_file": 6,
+          "mcp__project_tracker__get_issue": 3,
+          "write_file": 4,
+          "Bash": 7
+        },
+        "average_tokens": 20347.0
+      },
+      "B": {
+        "trials": 3,
+        "passed": 1,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 1,
+        "errors": 2,
+        "tool_calls": {
+          "load_skill": 3,
+          "read_file": 4,
+          "write_file": 3,
+          "Bash": 14,
+          "mcp__project_tracker__get_issue": 1
+        },
+        "average_tokens": 31922.0
+      }
+    },
+    "python-review": {
+      "A": {
+        "trials": 3,
+        "passed": 3,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 0,
+        "errors": 0,
+        "tool_calls": {
+          "read_file": 3,
+          "write_file": 3
+        },
+        "average_tokens": 7664.33
+      },
+      "B": {
+        "trials": 3,
+        "passed": 3,
+        "routing_errors": 1,
+        "usage_complete": 3,
+        "mcp_calls": 0,
+        "errors": 0,
+        "tool_calls": {
+          "load_skill": 2,
+          "read_file": 3,
+          "write_file": 3
+        },
+        "average_tokens": 8186.67
+      }
+    },
+    "no-matching-skill": {
+      "A": {
+        "trials": 3,
+        "passed": 1,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 0,
+        "errors": 1,
+        "tool_calls": {
+          "read_file": 2,
+          "write_file": 1
+        },
+        "average_tokens": 4793.67
+      },
+      "B": {
+        "trials": 3,
+        "passed": 3,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 0,
+        "errors": 0,
+        "tool_calls": {
+          "read_file": 3,
+          "write_file": 3
+        },
+        "average_tokens": 7988.0
+      }
+    },
+    "missing-data": {
+      "A": {
+        "trials": 3,
+        "passed": 1,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 0,
+        "errors": 3,
+        "tool_calls": {
+          "list_files": 1,
+          "read_file": 5
+        },
+        "average_tokens": 7070.33
+      },
+      "B": {
+        "trials": 3,
+        "passed": 1,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 0,
+        "errors": 3,
+        "tool_calls": {
+          "read_file": 6,
+          "list_files": 2
+        },
+        "average_tokens": 13504.67
+      }
+    },
+    "mcp-failure": {
+      "A": {
+        "trials": 3,
+        "passed": 3,
+        "routing_errors": 0,
+        "usage_complete": 3,
+        "mcp_calls": 9,
+        "errors": 3,
+        "tool_calls": {
+          "mcp__project_tracker__get_issue": 9
+        },
+        "average_tokens": 9806.33
+      },
+      "B": {
+        "trials": 3,
+        "passed": 3,
+        "routing_errors": 2,
+        "usage_complete": 3,
+        "mcp_calls": 10,
+        "errors": 3,
+        "tool_calls": {
+          "mcp__project_tracker__get_issue": 11,
+          "load_skill": 2
+        },
+        "average_tokens": 20147.67
+      }
+    }
+  }
+}

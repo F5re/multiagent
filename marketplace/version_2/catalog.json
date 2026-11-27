@@ -1,0 +1,22 @@
+{
+  "skills": [
+    {
+      "name": "investigate-test-failure",
+      "version": "2.0.0",
+      "description": "Investigate failing tests with explicit evidence and verification.",
+      "path": "investigate-test-failure"
+    },
+    {
+      "name": "security-review",
+      "version": "1.0.0",
+      "description": "Review Python code for concrete security risks.",
+      "path": "security-review"
+    },
+    {
+      "name": "broken-skill",
+      "version": "1.0.0",
+      "description": "Invalid package used by the negative market test.",
+      "path": "broken-skill"
+    }
+  ]
+}

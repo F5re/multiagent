@@ -1,0 +1,5 @@
+[
+  {"id": "T1", "status": "open"},
+  {"id": "T2", "status": "closed"},
+  {"id": "T3", "status": "open"}
+]

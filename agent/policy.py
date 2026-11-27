@@ -21,6 +21,7 @@ class Policy:
             self.allowed = [self._configured(x) for x in data["directories"]["allow"]]
             self.denied = [self._configured(x) for x in data["directories"]["deny"]]
             self.protected = [self._configured(x) for x in data["protected_files"]]
+            self.mcp_rules = data.get("mcp", {"allow_servers": [], "allow_tools": {}})
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise PolicyError("invalid policy file") from error
         if not self.allowed:
@@ -88,6 +89,12 @@ class Policy:
         return directory
 
     def check(self, name: str, arguments: dict, *, planning: bool) -> None:
+        if name in {"load_skill", "search_market"}:
+            return
+        if name == "install_skill":
+            if planning:
+                raise PolicyError("Plan Mode permits reading only")
+            return
         if planning and name not in {"list_files", "read_file"}:
             raise PolicyError("Plan Mode permits reading only")
         if name == "Bash":
@@ -99,6 +106,20 @@ class Policy:
             )
 
     def needs_approval(self, name: str, mode: str) -> bool:
-        return name == "delete_file" or (
+        return name in {"delete_file", "install_skill"} or (
             mode == "safe" and name in {"write_file", "Bash"}
         )
+
+    def mcp(self, server: str, tool: str, arguments: dict) -> None:
+        if server not in self.mcp_rules.get("allow_servers", []):
+            raise PolicyError(f"MCP server is not allowed: {server}")
+        allowed = self.mcp_rules.get("allow_tools", {}).get(server, [])
+        if tool not in allowed:
+            raise PolicyError(f"MCP tool is not allowed: {server}/{tool}")
+        if not isinstance(arguments, dict):
+            raise PolicyError("MCP arguments must be an object")
+        for value in arguments.values():
+            if isinstance(value, str) and (
+                ".." in Path(value).parts or "\x00" in value
+            ):
+                raise PolicyError("unsafe MCP argument")

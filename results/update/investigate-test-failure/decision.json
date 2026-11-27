@@ -1,0 +1,14 @@
+{
+  "accepted": false,
+  "reasons": [
+    "candidate skill routing did not pass every scenario",
+    "candidate failed a required limitation scenario"
+  ],
+  "token_growth": 0.09665177077056979,
+  "token_growth_limit": 0.2,
+  "skill": "investigate-test-failure",
+  "old_version": "1.0.0",
+  "new_version": "2.0.0",
+  "trials": 30,
+  "action": "rejected"
+}

@@ -6,12 +6,19 @@ from pathlib import Path
 import pytest
 
 import agent.engine as engine_module
-from agent.cli import show
+from agent.cli import chat_loop, parser, show
+from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError, parse_plan
+from agent.evals import EvalRunner, check_result
+from agent.events import format_event
+from agent.market import Market, MarketError
+from agent.mcp_client import MCPClient, MCPError
 from agent.model import FakeModel, text_tool_calls
 from agent.policy import Policy, PolicyError
+from agent.skills import SkillRegistry
 from agent.storage import StateConflict, Store
 from agent.tools import execute as real_execute
+from agent.updates import SkillUpdater, UpdateError
 
 ROOT = Path(__file__).parents[1]
 BROKEN = (
@@ -32,11 +39,11 @@ INCOMPLETE = (
 )
 
 
-def call(call_id: str, name: str, **arguments: str) -> dict:
+def call(call_id: str, tool_name: str, **arguments: str) -> dict:
     return {
         "id": call_id,
         "type": "function",
-        "function": {"name": name, "arguments": json.dumps(arguments)},
+        "function": {"name": tool_name, "arguments": json.dumps(arguments)},
     }
 
 
@@ -261,6 +268,31 @@ def test_plan_accepts_other_files_and_task_counts() -> None:
     assert len(parse_plan(json.dumps(four_tasks))["steps"]) == 4
 
 
+def test_plan_normalizes_mcp_task_to_verifiable_result() -> None:
+    plan = {
+        "goal": "Read issue",
+        "steps": [
+            {
+                "id": "issue",
+                "description": "Read issue through MCP",
+                "depends_on": [],
+                "tools": ["mcp__project_tracker__get_issue"],
+                "verification": {"kind": "read_files", "paths": []},
+            }
+        ],
+        "risks": [],
+        "assumptions": [],
+        "done_when": "Issue was returned",
+    }
+
+    parsed = parse_plan(json.dumps(plan), {"mcp__project_tracker__get_issue"})
+
+    assert parsed["steps"][0]["verification"] == {
+        "kind": "mcp_succeeded",
+        "tool": "mcp__project_tracker__get_issue",
+    }
+
+
 def test_plan_rejects_file_change_after_tests_pass() -> None:
     plan = json.loads(plan_reply()["content"])
     plan["steps"][1]["depends_on"] = ["verify"]
@@ -268,6 +300,32 @@ def test_plan_rejects_file_change_after_tests_pass() -> None:
 
     with pytest.raises(AgentError, match="changes files after tests_pass"):
         parse_plan(json.dumps(plan))
+
+
+def test_planner_explains_how_to_fix_file_change_after_tests(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    invalid = json.loads(plan_reply()["content"])
+    invalid["steps"][1]["depends_on"] = ["verify"]
+    invalid["steps"][2]["depends_on"] = ["inspect"]
+    agent = make_agent(
+        project,
+        [
+            final(json.dumps(invalid)),
+            final(json.dumps(invalid)),
+            plan_reply(),
+        ],
+    )
+
+    state = agent.start("Fix")
+
+    assert state["phase"] == "waiting_plan"
+    corrections = [
+        message["content"]
+        for message in state["messages"]
+        if message["role"] == "user" and "Move every write_file" in message["content"]
+    ]
+    assert len(corrections) == 2
+    assert "leave no file-changing task after it" in corrections[0]
 
 
 @pytest.mark.parametrize(
@@ -499,7 +557,8 @@ def test_plan_mode_blocks_side_effects_and_repairs_invalid_plan(tmp_path: Path) 
     assert state["used"]["side_effects"] == 0
     assert json.loads(state["calls"]["bad"]["result"])["ok"] is False
     assert all(
-        {tool["function"]["name"] for tool in tools} <= {"list_files", "read_file"}
+        {tool["function"]["name"] for tool in tools}
+        <= {"list_files", "read_file", "load_skill"}
         for _, tools in agent.model.requests
     )
 
@@ -534,6 +593,61 @@ def test_plan_mode_blocks_side_effects_and_repairs_invalid_plan(tmp_path: Path) 
     assert "planning failed after 3 attempts" in invalid["error"]
 
 
+def test_plan_mode_rejects_unadvertised_market_install(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(call("early", "install_skill", name="security-review")),
+                plan_reply(),
+            ]
+        ),
+        market_config=ROOT / "config" / "market.json",
+    )
+
+    state = agent.start("Plan before installing anything")
+
+    assert state["phase"] == "waiting_plan"
+    assert not (project[0].parent / "skills" / "security-review").exists()
+    assert state["used"]["side_effects"] == 0
+    assert "Plan Mode" in json.loads(state["calls"]["early"]["result"])["error"]
+
+
+def test_plan_mode_rejects_unadvertised_writable_mcp(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(
+                    call(
+                        "early",
+                        "mcp__project_tracker__get_issue",
+                        issue_id="ISSUE-1",
+                    )
+                ),
+                plan_reply(),
+            ]
+        ),
+        skills_enabled=False,
+        mcp_config=ROOT / "config" / "mcp.json",
+    )
+    agent.mcp._tools["mcp__project_tracker__get_issue"]["read_only"] = False
+
+    state = agent.start("Plan without MCP side effects")
+
+    assert state["phase"] == "waiting_plan"
+    assert not any(
+        event["type"] == "mcp_call" for event in agent.store.events(state["session_id"])
+    )
+    assert "read-only" in json.loads(state["calls"]["early"]["result"])["error"]
+
+
 def test_agent_cannot_finish_test_task_without_model_bash_call(tmp_path: Path) -> None:
     project = make_project(tmp_path)
     agent = make_agent(
@@ -556,8 +670,49 @@ def test_agent_cannot_finish_test_task_without_model_bash_call(tmp_path: Path) -
 
     assert failed["phase"] == "failed"
     assert failed["error"] == "task verify has no verified result"
+    assert failed["answer"] == "Done."
     assert all(item["name"] != "Bash" for item in failed["calls"].values())
     assert failed["tasks"][-1]["evidence"] is None
+
+
+def test_rejected_bash_gets_exact_feedback_but_model_must_call_it(
+    tmp_path: Path,
+) -> None:
+    project = make_project(tmp_path)
+    agent = make_agent(
+        project,
+        [
+            plan_reply(),
+            tool_reply(
+                call("source", "read_file", path="order.py"),
+                call("tests", "read_file", path="test_order.py"),
+            ),
+            tool_reply(call("write", "write_file", path="order.py", content=FIXED)),
+            tool_reply(call("bad_bash", "Bash", command="python3 -m unittest -v")),
+            tool_reply(
+                call(
+                    "good_bash",
+                    "Bash",
+                    command="python3 -m unittest -v",
+                    cwd=".",
+                )
+            ),
+            final("Passed."),
+        ],
+    )
+
+    waiting = agent.start("Fix")
+    completed = agent.approve_plan(waiting["id"], True)
+
+    assert completed["phase"] == "completed"
+    assert json.loads(completed["calls"]["bad_bash"]["result"])["ok"] is False
+    assert completed["tasks"][-1]["evidence"]["tool_call_id"] == "good_bash"
+    feedback = [
+        message["content"]
+        for message in completed["messages"]
+        if message["role"] == "user" and "exactly these arguments" in message["content"]
+    ]
+    assert '"cwd": "."' in feedback[0]
 
 
 def test_safe_mode_waits_for_write_and_bash_approval(tmp_path: Path) -> None:
@@ -853,3 +1008,727 @@ def test_sqlite_conflict_prevents_two_writers(tmp_path: Path) -> None:
     with pytest.raises(StateConflict):
         store.save(second)
     assert store.load("run")["value"] == 1
+
+
+def test_session_events_stats_and_jsonl_export(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session_id = store.create_session("session")
+    state = {
+        "id": "run",
+        "session_id": session_id,
+        "request": "inspect",
+        "usage": {"input_tokens": 12, "output_tokens": 3, "complete": True},
+    }
+    store.create(state)
+    event = store.add_event(
+        session_id,
+        "run",
+        "tool_call",
+        {"name": "read_file", "arguments": {"path": "order.py"}},
+    )
+    store.add_event(
+        session_id,
+        "run",
+        "tool_result",
+        {"name": "read_file", "ok": True},
+    )
+
+    assert set(event) == {"id", "time", "session_id", "run_id", "type", "data"}
+    assert format_event(event) == "[tool] read_file: requested"
+    stats = store.session_stats(session_id)
+    assert stats["runs"] == 1
+    assert stats["tools"] == {"read_file": 1}
+    assert stats["input_tokens"] == 12
+    assert stats["usage_complete"] is True
+
+    output = tmp_path / "events.jsonl"
+    store.export_events(session_id, output)
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["tool_call", "tool_result"]
+
+
+def test_next_run_receives_previous_session_context(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = make_agent(
+        project,
+        [
+            plan_reply(),
+            tool_reply(
+                call("source", "read_file", path="order.py"),
+                call("tests", "read_file", path="test_order.py"),
+            ),
+            tool_reply(call("write", "write_file", path="order.py", content=FIXED)),
+            tool_reply(
+                call(
+                    "bash",
+                    "Bash",
+                    command="python3 -m unittest -v",
+                    cwd=".",
+                )
+            ),
+            final("The calculation was fixed."),
+            plan_reply(),
+        ],
+    )
+
+    first = agent.start("Fix calculation", session_id="conversation")
+    completed = agent.approve_plan(first["id"], True)
+    second = agent.start("Now explain the change", session_id="conversation")
+
+    assert completed["phase"] == "completed"
+    assert second["session_id"] == completed["session_id"]
+    previous = [
+        message["content"]
+        for message in second["messages"]
+        if message["role"] == "system"
+        and message["content"].startswith("Previous conversation")
+    ]
+    assert "Fix calculation" in previous[0]
+    assert "The calculation was fixed." in previous[0]
+
+
+def test_model_usage_is_saved_and_logged(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    answer = plan_reply()
+    answer["_usage"] = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "complete": True,
+    }
+    agent = make_agent(project, [answer])
+
+    state = agent.start("Fix")
+
+    assert state["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "complete": True,
+    }
+    events = agent.store.events(state["session_id"])
+    assert [event["type"] for event in events] == ["run_started", "model_usage"]
+
+
+def test_skill_is_discovered_selected_and_loaded(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(
+                    call(
+                        "skill",
+                        "load_skill",
+                        name="investigate-test-failure",
+                    )
+                ),
+                plan_reply(),
+            ]
+        ),
+    )
+
+    state = agent.start("Fix a failing test")
+
+    assert state["phase"] == "waiting_plan"
+    assert state["loaded_skills"] == {"investigate-test-failure": "1.0.0"}
+    first_tools = {tool["function"]["name"] for tool in agent.model.requests[0][1]}
+    assert "load_skill" in first_tools
+    initial_messages = agent.model.requests[0][0]
+    assert "investigate-test-failure" in initial_messages[1]["content"]
+    assert "Run the relevant tests" not in initial_messages[1]["content"]
+    events = agent.store.events(state["session_id"])
+    assert "skill_discovered" in {event["type"] for event in events}
+    assert "skill_loaded" in {event["type"] for event in events}
+
+
+def test_invalid_skill_does_not_hide_valid_skills(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    shutil.copytree(ROOT / "skills" / "release-notes", root / "release-notes")
+    broken = root / "broken"
+    broken.mkdir()
+    (broken / "SKILL.md").write_text("not frontmatter", encoding="utf-8")
+
+    registry = SkillRegistry(root)
+
+    assert [skill["name"] for skill in registry.catalog()] == ["release-notes"]
+    assert registry.errors[0]["path"].endswith("broken/SKILL.md")
+
+
+def test_skills_can_be_disabled_for_variant_a(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(ROOT / "skills" / "release-notes", skills / "release-notes")
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel([plan_reply()]),
+        skills_enabled=False,
+    )
+
+    state = agent.start("Fix")
+
+    assert state["loaded_skills"] == {}
+    assert "load_skill" not in {
+        tool["function"]["name"] for tool in agent.model.requests[0][1]
+    }
+
+
+def test_model_can_explicitly_choose_no_skill(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(ROOT / "skills" / "release-notes", skills / "release-notes")
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel([final("NO_SKILL"), plan_reply()]),
+    )
+
+    state = agent.start("Fix code")
+
+    assert state["phase"] == "waiting_plan"
+    assert state["loaded_skills"] == {}
+    assert {tool["function"]["name"] for tool in agent.model.requests[0][1]} == {
+        "load_skill"
+    }
+    routing = [
+        event
+        for event in agent.store.events(state["session_id"])
+        if event["type"] == "skill_routing"
+    ]
+    assert routing[0]["data"] == {"selected": []}
+
+
+def test_mcp_discovers_and_calls_configured_tool() -> None:
+    client = MCPClient(ROOT / "config" / "mcp.json")
+
+    assert "mcp__project_tracker__get_issue" in client.names()
+    result = client.call("mcp__project_tracker__get_issue", {"issue_id": "ISSUE-1"})
+    issue = json.loads(result["content"][0]["text"])
+    assert issue["file"] == "order.py"
+
+
+def test_mcp_error_and_timeout_are_clear(tmp_path: Path) -> None:
+    config = {
+        "servers": {
+            "project_tracker": {
+                "command": [
+                    "{python}",
+                    str(ROOT / "mcp_servers" / "project_tracker.py"),
+                ],
+                "timeout_seconds": 0.1,
+            }
+        }
+    }
+    filename = tmp_path / "config" / "mcp.json"
+    filename.parent.mkdir()
+    filename.write_text(json.dumps(config), encoding="utf-8")
+    client = MCPClient(filename)
+
+    with pytest.raises(MCPError, match="synthetic tracker failure"):
+        client.call("mcp__project_tracker__get_issue", {"issue_id": "ERROR"})
+    with pytest.raises(MCPError, match="timed out"):
+        client.call("mcp__project_tracker__get_issue", {"issue_id": "TIMEOUT"})
+
+
+def test_mcp_policy_can_deny_an_available_tool(tmp_path: Path) -> None:
+    workspace, policy_file, _ = make_project(tmp_path)
+    data = json.loads(policy_file.read_text(encoding="utf-8"))
+    data["mcp"]["allow_tools"]["project_tracker"] = []
+    policy_file.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(PolicyError, match="MCP tool is not allowed"):
+        Policy(workspace, policy_file).mcp(
+            "project_tracker", "get_issue", {"issue_id": "ISSUE-1"}
+        )
+
+
+def test_agent_exposes_and_logs_mcp_calls(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(
+                    call(
+                        "issue",
+                        "mcp__project_tracker__get_issue",
+                        issue_id="ISSUE-1",
+                    )
+                ),
+                plan_reply(),
+            ]
+        ),
+        mcp_config=ROOT / "config" / "mcp.json",
+    )
+
+    state = agent.start("Inspect issue ISSUE-1")
+
+    assert state["phase"] == "waiting_plan"
+    assert "mcp__project_tracker__get_issue" in {
+        tool["function"]["name"] for tool in agent.model.requests[0][1]
+    }
+    event_types = [event["type"] for event in agent.store.events(state["session_id"])]
+    assert "mcp_call" in event_types
+    assert "mcp_result" in event_types
+
+
+def test_doctor_finds_repeated_errors_and_unverified_completion(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session = store.create_session("problem")
+    for index in range(2):
+        store.add_event(
+            session,
+            "run",
+            "tool_result",
+            {"name": "Bash", "ok": False, "attempt": index + 1},
+        )
+    store.add_event(session, "run", "run_finished", {"status": "completed"})
+
+    report = analyze_session(store, session)
+
+    assert {item["type"] for item in report["findings"]} == {
+        "repeated_tool_error",
+        "completed_without_verification",
+    }
+    assert all(item["run_id"] == "run" for item in report["findings"])
+    assert all(item["event_ids"] for item in report["findings"])
+    assert "failures" in format_report(report)
+    assert "Tools:" in format_report(report)
+
+
+def test_doctor_does_not_flag_similar_normal_run(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session = store.create_session("normal")
+    store.add_event(session, "run", "tool_result", {"name": "Bash", "ok": False})
+    store.add_event(
+        session,
+        "run",
+        "task_completed",
+        {"task_id": "test", "evidence": {"exit_code": 0}},
+    )
+    store.add_event(session, "run", "run_finished", {"status": "completed"})
+
+    report = analyze_session(store, session)
+
+    assert report["findings"] == []
+
+
+def test_doctor_shows_usage_for_each_run(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session = store.create_session()
+    store.create(
+        {
+            "id": "first",
+            "session_id": session,
+            "usage": {"input_tokens": 100, "output_tokens": 20, "complete": True},
+        }
+    )
+    store.create(
+        {
+            "id": "second",
+            "session_id": session,
+            "usage": {"input_tokens": 50, "output_tokens": 5, "complete": False},
+        }
+    )
+
+    report = analyze_session(store, session)
+
+    assert report["run_usage"][0]["input_tokens"] == 100
+    assert report["run_usage"][1]["input_tokens"] is None
+    assert "Run first: tokens input=100; output=20" in format_report(report)
+    assert "Run second: tokens unknown or incomplete" in format_report(report)
+
+
+def test_eval_runner_restores_trials_checks_results_and_resumes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config").mkdir()
+    shutil.copy(ROOT / "config" / "policy.json", tmp_path / "config" / "policy.json")
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "tasks.json").write_text(
+        '[{"id":"T1","status":"open"},{"id":"T3","status":"open"}]',
+        encoding="utf-8",
+    )
+    cases = [
+        {
+            "id": "ids",
+            "request": "Create ids.json",
+            "fixture": "fixture",
+            "checker": "json_ids",
+            "expected_skill": None,
+            "required_tools": ["write_file"],
+        }
+    ]
+    cases_file = tmp_path / "cases.json"
+    cases_file.write_text(json.dumps(cases), encoding="utf-8")
+    plan = {
+        "goal": "Create IDs",
+        "steps": [
+            {
+                "id": "read",
+                "description": "Read tasks",
+                "depends_on": [],
+                "tools": ["read_file"],
+                "verification": {"kind": "read_files", "paths": ["tasks.json"]},
+            },
+            {
+                "id": "write",
+                "description": "Write IDs",
+                "depends_on": ["read"],
+                "tools": ["write_file"],
+                "verification": {"kind": "file_changed", "path": "ids.json"},
+            },
+        ],
+        "risks": [],
+        "assumptions": [],
+        "done_when": "ids.json exists",
+    }
+
+    def model_factory() -> FakeModel:
+        return FakeModel(
+            [
+                final(json.dumps(plan)),
+                tool_reply(call("read", "read_file", path="tasks.json")),
+                tool_reply(
+                    call("write", "write_file", path="ids.json", content='["T1","T3"]')
+                ),
+                final("Created IDs."),
+            ]
+        )
+
+    runner = EvalRunner(
+        tmp_path, cases_file, tmp_path / "results", model_factory=model_factory
+    )
+    first = runner.run(trials=1)
+    second = runner.run(trials=1)
+
+    assert len(first) == len(second) == 2
+    assert all(item["outcome_pass"] for item in first)
+    assert all(item["answer"] == "Created IDs." for item in first)
+    assert {item["variant"] for item in first} == {"A", "B"}
+    assert (tmp_path / "results" / "summary.md").is_file()
+    summary = (tmp_path / "results" / "summary.md").read_text()
+    assert "routing errors:" in summary
+    assert "usage complete:" in summary
+    assert len((tmp_path / "results" / "results.jsonl").read_text().splitlines()) == 2
+
+
+def test_eval_checks_real_files_and_explanations(tmp_path: Path) -> None:
+    fixture = ROOT / "evals" / "fixtures" / "fix-failing-test"
+    workspace = tmp_path / "workspace"
+    shutil.copytree(fixture, workspace)
+    (workspace / "order.py").write_text(FIXED, encoding="utf-8")
+    completed = {"phase": "completed", "answer": "Tests passed."}
+
+    assert check_result("order_tests", workspace, completed, [], fixture)
+    (workspace / "test_order.py").write_text(
+        (workspace / "test_order.py").read_text() + "\n", encoding="utf-8"
+    )
+    assert not check_result("order_tests", workspace, completed, [], fixture)
+
+    (workspace / "review.md").write_text(
+        "Correctness\nMaintainability\nTests", encoding="utf-8"
+    )
+    assert not check_result("review_report", workspace, completed, [], fixture)
+    (workspace / "review.md").write_text(
+        "Correctness\nSafety\nMaintainability\nTests", encoding="utf-8"
+    )
+    assert check_result("review_report", workspace, completed, [], fixture)
+
+    failed = {"phase": "failed", "error": "task has no verified result"}
+    assert not check_result("missing_data", workspace, failed, [], fixture)
+    failed["answer"] = "Source file is missing; I cannot create a summary."
+    assert check_result("missing_data", workspace, failed, [], fixture)
+    mcp_events = [{"type": "mcp_result", "data": {"ok": False}}]
+    assert not check_result("mcp_failure", workspace, completed, mcp_events, fixture)
+    failed["answer"] = "MCP returned an error; no issue data is available."
+    assert check_result("mcp_failure", workspace, failed, mcp_events, fixture)
+
+
+def test_market_detects_new_update_and_does_not_restage(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    market = Market(ROOT / "config" / "market.json", skills, tmp_path / "market-state")
+
+    first = market.check()
+    second = market.check()
+
+    assert {item["name"] for item in first["new"]} == {
+        "security-review",
+        "broken-skill",
+    }
+    assert first["updates"][0]["name"] == "investigate-test-failure"
+    assert first["updates"][0]["old_revision"]
+    assert first["updates"][0]["revision"]
+    assert first["staged"] == ["investigate-test-failure"]
+    assert second["staged"] == []
+    assert market.candidate("investigate-test-failure").is_dir()
+
+
+def test_market_installs_valid_package_and_keeps_invalid_out(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    market = Market(ROOT / "config" / "market.json", skills, tmp_path / "market-state")
+
+    found = market.search("security")
+    installed = market.install("security-review")
+
+    assert found[0]["name"] == "security-review"
+    assert installed["installed"] is True
+    assert (skills / "security-review" / "SKILL.md").is_file()
+    with pytest.raises(MarketError):
+        market.install("broken-skill")
+    assert not (skills / "broken-skill").exists()
+    assert (skills / "security-review" / "SKILL.md").is_file()
+
+
+def test_market_auto_update_can_be_disabled(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    market = Market(
+        ROOT / "config" / "market_v2_no_update.json",
+        skills,
+        tmp_path / "market-state",
+    )
+
+    result = market.check()
+
+    assert result["updates"]
+    assert result["staged"] == []
+
+
+def test_market_install_is_a_verified_approved_runtime_action(
+    tmp_path: Path,
+) -> None:
+    project = make_project(tmp_path)
+    plan = {
+        "goal": "Install security review skill",
+        "steps": [
+            {
+                "id": "install",
+                "description": "Install the selected skill",
+                "depends_on": [],
+                "tools": ["install_skill"],
+                "verification": {
+                    "kind": "skill_installed",
+                    "name": "security-review",
+                },
+            }
+        ],
+        "risks": [],
+        "assumptions": [],
+        "done_when": "Skill is installed",
+    }
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                final(json.dumps(plan)),
+                tool_reply(call("install", "install_skill", name="security-review")),
+                final("Installed."),
+            ]
+        ),
+        market_config=ROOT / "config" / "market.json",
+    )
+    waiting_plan = agent.start("Install a security review skill")
+    waiting_action = agent.approve_plan(waiting_plan["id"], True)
+
+    assert waiting_action["phase"] == "waiting_action"
+    assert (
+        waiting_action["calls"][waiting_action["queue"][0]]["name"] == "install_skill"
+    )
+    completed = agent.decide_action(waiting_action["id"], True)
+    assert completed["phase"] == "completed"
+
+
+def update_results(*, regression: bool = False, complete: bool = True) -> list[dict]:
+    results = []
+    for case_id in (
+        "fix-failing-test",
+        "python-review",
+        "no-matching-skill",
+        "missing-data",
+        "mcp-failure",
+    ):
+        for variant in ("old", "new"):
+            for trial in range(1, 4):
+                passed = not (
+                    regression and case_id == "python-review" and variant == "new"
+                )
+                results.append(
+                    {
+                        "case_id": case_id,
+                        "variant": variant,
+                        "trial": trial,
+                        "outcome_pass": passed,
+                        "routing_pass_or_na": True,
+                        "usage_complete": complete,
+                        "input_tokens": 100 if complete else None,
+                        "output_tokens": 10 if complete else None,
+                    }
+                )
+    return results
+
+
+def test_update_decision_accepts_only_non_regressing_complete_results(
+    tmp_path: Path,
+) -> None:
+    updater = SkillUpdater(
+        ROOT,
+        ROOT / "config" / "market.json",
+        skills_dir=ROOT / "skills",
+        state_dir=tmp_path / "updates",
+    )
+
+    accepted = updater.decide(update_results())
+    regressed = updater.decide(update_results(regression=True))
+    incomplete = updater.decide(update_results(complete=False))
+
+    assert accepted["accepted"] is True
+    assert regressed["accepted"] is False
+    assert any("decreased" in reason for reason in regressed["reasons"])
+    assert incomplete["accepted"] is False
+    assert "token usage is incomplete" in incomplete["reasons"]
+    assert updater.decide(update_results()[:-1])["accepted"] is False
+
+
+def test_update_cli_can_request_a_fresh_comparison() -> None:
+    arguments = parser().parse_args(
+        ["update", "evaluate", "investigate-test-failure", "--fresh"]
+    )
+
+    assert arguments.fresh is True
+
+
+def test_skill_update_applies_atomically_and_rolls_back(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    updater = SkillUpdater(
+        ROOT,
+        ROOT / "config" / "market.json",
+        skills_dir=skills,
+        state_dir=tmp_path / "updates",
+    )
+    updater.market.stage("investigate-test-failure")
+
+    with pytest.raises(UpdateError, match="accepted eval decision"):
+        updater.apply("investigate-test-failure")
+    decision_file = (
+        tmp_path
+        / "updates"
+        / "comparisons"
+        / "investigate-test-failure"
+        / "decision.json"
+    )
+    decision_file.parent.mkdir(parents=True)
+    decision = {
+        "accepted": False,
+        "action": "rejected",
+        "old_version": "1.0.0",
+        "new_version": "2.0.0",
+        "candidate_revision": updater.market.catalog["investigate-test-failure"][
+            "revision"
+        ],
+        "trials": 30,
+    }
+    decision_file.write_text(json.dumps(decision), encoding="utf-8")
+    with pytest.raises(UpdateError, match="matching accepted"):
+        updater.apply("investigate-test-failure")
+    decision.update(accepted=True, action="ready")
+    decision_file.write_text(json.dumps(decision), encoding="utf-8")
+
+    applied = updater.apply("investigate-test-failure")
+    assert applied["old_version"] == "1.0.0"
+    assert SkillRegistry(skills).load("investigate-test-failure").version == "2.0.0"
+
+    rolled_back = updater.rollback("investigate-test-failure")
+    assert rolled_back["to_version"] == "1.0.0"
+    assert SkillRegistry(skills).load("investigate-test-failure").version == "1.0.0"
+    with pytest.raises(UpdateError, match="no rollback"):
+        updater.rollback("investigate-test-failure")
+
+
+def test_chat_can_roll_back_an_accepted_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    updater = SkillUpdater(
+        project[0].parent,
+        ROOT / "config" / "market.json",
+        skills_dir=skills,
+        state_dir=project[0].parent / "updates",
+    )
+    updater.market.stage("investigate-test-failure")
+    decision = {
+        "accepted": True,
+        "action": "ready",
+        "old_version": "1.0.0",
+        "new_version": "2.0.0",
+        "candidate_revision": updater.market.catalog["investigate-test-failure"][
+            "revision"
+        ],
+        "trials": 30,
+    }
+    decision_file = (
+        project[0].parent
+        / "updates"
+        / "comparisons"
+        / "investigate-test-failure"
+        / "decision.json"
+    )
+    decision_file.parent.mkdir(parents=True)
+    decision_file.write_text(json.dumps(decision), encoding="utf-8")
+    updater.apply("investigate-test-failure")
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel([]),
+        skills_dir=skills,
+        market_config=ROOT / "config" / "market.json",
+    )
+    inputs = iter(
+        [
+            "/update rollback investigate-test-failure",
+            "/update rollback investigate-test-failure",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    assert chat_loop(agent, "auto", None) == 0
+    assert SkillRegistry(skills).load("investigate-test-failure").version == "1.0.0"
+    output = capsys.readouterr().out
+    assert "to_version: 1.0.0" in output
+    assert "no rollback version is available" in output
+    assert "Session closed." in output
