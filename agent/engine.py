@@ -294,6 +294,11 @@ class Agent:
                         "testing alone cannot complete a code-change request. Use "
                         "tests_pass only for a final successful test after planned "
                         "file changes, never for a diagnostic test before a fix. "
+                        "A tests_pass task must be terminal: no task that changes "
+                        "or deletes files may depend on it, directly or indirectly. "
+                        "Put requested reports and other file changes before the "
+                        "final tests_pass task. Put an unrequested summary in the "
+                        "final answer instead of creating another file. "
                         "Verification forms: "
                         '{"kind":"read_files","paths":["module.py"]} requires '
                         "read_file in tools; "
@@ -615,10 +620,20 @@ class Agent:
                     self.store.save(state)
                     self._event(state, "error", {"message": state["error"]}, True)
                     return
+                correction = ""
+                if "changes files after tests_pass" in str(error):
+                    correction = (
+                        " Move every write_file and delete_file task before the "
+                        "tests_pass task. Make tests_pass depend on all required "
+                        "file changes and leave no file-changing task after it."
+                    )
                 state["messages"].append(
                     {
                         "role": "user",
-                        "content": f"Invalid plan: {error}. Return corrected JSON.",
+                        "content": (
+                            f"Invalid plan: {error}.{correction} "
+                            "Return corrected JSON only."
+                        ),
                     }
                 )
                 self.store.save(state)

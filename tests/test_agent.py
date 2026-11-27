@@ -302,6 +302,32 @@ def test_plan_rejects_file_change_after_tests_pass() -> None:
         parse_plan(json.dumps(plan))
 
 
+def test_planner_explains_how_to_fix_file_change_after_tests(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    invalid = json.loads(plan_reply()["content"])
+    invalid["steps"][1]["depends_on"] = ["verify"]
+    invalid["steps"][2]["depends_on"] = ["inspect"]
+    agent = make_agent(
+        project,
+        [
+            final(json.dumps(invalid)),
+            final(json.dumps(invalid)),
+            plan_reply(),
+        ],
+    )
+
+    state = agent.start("Fix")
+
+    assert state["phase"] == "waiting_plan"
+    corrections = [
+        message["content"]
+        for message in state["messages"]
+        if message["role"] == "user" and "Move every write_file" in message["content"]
+    ]
+    assert len(corrections) == 2
+    assert "leave no file-changing task after it" in corrections[0]
+
+
 @pytest.mark.parametrize(
     "change",
     (
