@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from agent.evals import EvalRunner
+from agent.evals import CHECKER_VERSION, EvalRunner
 from agent.market import Market
 from agent.model import ChatModel
 from agent.skills import SkillRegistry
@@ -33,12 +33,31 @@ class SkillUpdater:
             market_config, self.skills_dir, self.state_dir.parent / "market"
         )
 
-    def evaluate(self, name: str, trials: int = 3) -> dict:
+    def evaluate(self, name: str, trials: int = 3, fresh: bool = False) -> dict:
+        if trials != 3:
+            raise UpdateError(
+                "update evaluation requires three trials per case and version"
+            )
         if not self.market.installed(name):
             raise UpdateError("skill must be installed before update evaluation")
         self.market.stage(name)
         candidate = self.market.candidate(name)
         comparison = self.state_dir / "comparisons" / name
+        saved = comparison / "results.jsonl"
+        if comparison.exists() and fresh:
+            archive = self.state_dir / "archive" / name / uuid.uuid4().hex
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(comparison, archive)
+        elif saved.is_file():
+            versions = {
+                json.loads(line).get("checker_version")
+                for line in saved.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+            if versions != {CHECKER_VERSION}:
+                archive = self.state_dir / "archive" / name / uuid.uuid4().hex
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(comparison, archive)
         old_skills = comparison / "configurations" / "old"
         new_skills = comparison / "configurations" / "new"
         for directory in (old_skills, new_skills):
@@ -63,16 +82,20 @@ class SkillUpdater:
                 "new_version": SkillRegistry._read(
                     candidate / "SKILL.md", False
                 ).version,
+                "candidate_revision": self.market.catalog[name]["revision"],
                 "trials": len(results),
             }
+        )
+        comparison.mkdir(parents=True, exist_ok=True)
+        decision_file = comparison / "decision.json"
+        decision["action"] = "ready" if decision["accepted"] else "rejected"
+        decision_file.write_text(
+            json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         if decision["accepted"]:
             self.apply(name)
             decision["action"] = "applied"
-        else:
-            decision["action"] = "rejected"
-        comparison.mkdir(parents=True, exist_ok=True)
-        (comparison / "decision.json").write_text(
+        decision_file.write_text(
             json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         self._log("update_decision", decision)
@@ -85,6 +108,21 @@ class SkillUpdater:
             grouped.setdefault(item["case_id"], {}).setdefault(
                 item["variant"], []
             ).append(item)
+        expected_cases = {
+            "fix-failing-test",
+            "python-review",
+            "no-matching-skill",
+            "missing-data",
+            "mcp-failure",
+        }
+        if set(grouped) != expected_cases or any(
+            len(variants.get(variant, [])) != 3
+            for variants in grouped.values()
+            for variant in ("old", "new")
+        ):
+            reasons.append(
+                "comparison requires five cases and three trials per version"
+            )
         for case_id, variants in grouped.items():
             old_pass = sum(item["outcome_pass"] for item in variants.get("old", []))
             new_pass = sum(item["outcome_pass"] for item in variants.get("new", []))
@@ -129,6 +167,20 @@ class SkillUpdater:
         current = SkillRegistry(self.skills_dir).load(name)
         candidate = self.market.candidate(name)
         updated = SkillRegistry._read(candidate / "SKILL.md", False)
+        decision_file = self.state_dir / "comparisons" / name / "decision.json"
+        if not decision_file.is_file():
+            raise UpdateError("accepted eval decision is required before apply")
+        decision = json.loads(decision_file.read_text(encoding="utf-8"))
+        if not (
+            decision.get("accepted") is True
+            and decision.get("action") == "ready"
+            and decision.get("old_version") == current.version
+            and decision.get("new_version") == updated.version
+            and decision.get("candidate_revision")
+            == self.market.catalog[name]["revision"]
+            and decision.get("trials") == 30
+        ):
+            raise UpdateError("candidate has no matching accepted eval decision")
         if current.version == updated.version:
             raise UpdateError("candidate version is already active")
         backup = self.state_dir / "backups" / name / current.version

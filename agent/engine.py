@@ -644,7 +644,7 @@ class Agent:
         task = self._current_task(state)
         evidence = self._verify(state, task) if task else None
         if task and evidence is None:
-            self._retry_task(state, task)
+            self._retry_task(state, task, content)
             return
         if task:
             task["status"] = "completed"
@@ -662,11 +662,13 @@ class Agent:
         if state["phase"] == "completed":
             self._event(state, "run_finished", {"status": "completed"}, True)
 
-    def _retry_task(self, state: dict, task: dict) -> None:
+    def _retry_task(self, state: dict, task: dict, answer: str | None = None) -> None:
         task["repair_attempts"] = task.get("repair_attempts", 0) + 1
         if task["repair_attempts"] >= 3:
             state["phase"] = "failed"
             state["error"] = f"task {task['id']} has no verified result"
+            if answer:
+                state["answer"] = answer
         else:
             required = required_tool(task["verification"])
             state["messages"].append(
@@ -773,6 +775,10 @@ class Agent:
                 return
             try:
                 if call["name"] in self.mcp.names():
+                    if state["phase"] == "planning" and not self.mcp.is_read_only(
+                        call["name"]
+                    ):
+                        raise ValueError("Plan Mode permits read-only MCP tools only")
                     self.mcp.validate(call["name"], call["arguments"])
                     server, remote_name = self.mcp.details(call["name"])
                     self.policy.mcp(server, remote_name, call["arguments"])

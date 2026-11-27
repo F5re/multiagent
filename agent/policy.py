@@ -89,7 +89,11 @@ class Policy:
         return directory
 
     def check(self, name: str, arguments: dict, *, planning: bool) -> None:
-        if name in {"load_skill", "search_market", "install_skill"}:
+        if name in {"load_skill", "search_market"}:
+            return
+        if name == "install_skill":
+            if planning:
+                raise PolicyError("Plan Mode permits reading only")
             return
         if planning and name not in {"list_files", "read_file"}:
             raise PolicyError("Plan Mode permits reading only")

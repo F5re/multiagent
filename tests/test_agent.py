@@ -6,10 +6,10 @@ from pathlib import Path
 import pytest
 
 import agent.engine as engine_module
-from agent.cli import show
+from agent.cli import chat_loop, parser, show
 from agent.doctor import analyze_session, format_report
 from agent.engine import Agent, AgentError, parse_plan
-from agent.evals import EvalRunner
+from agent.evals import EvalRunner, check_result
 from agent.events import format_event
 from agent.market import Market, MarketError
 from agent.mcp_client import MCPClient, MCPError
@@ -593,6 +593,61 @@ def test_plan_mode_blocks_side_effects_and_repairs_invalid_plan(tmp_path: Path) 
     assert "planning failed after 3 attempts" in invalid["error"]
 
 
+def test_plan_mode_rejects_unadvertised_market_install(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(call("early", "install_skill", name="security-review")),
+                plan_reply(),
+            ]
+        ),
+        market_config=ROOT / "config" / "market.json",
+    )
+
+    state = agent.start("Plan before installing anything")
+
+    assert state["phase"] == "waiting_plan"
+    assert not (project[0].parent / "skills" / "security-review").exists()
+    assert state["used"]["side_effects"] == 0
+    assert "Plan Mode" in json.loads(state["calls"]["early"]["result"])["error"]
+
+
+def test_plan_mode_rejects_unadvertised_writable_mcp(tmp_path: Path) -> None:
+    project = make_project(tmp_path)
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel(
+            [
+                tool_reply(
+                    call(
+                        "early",
+                        "mcp__project_tracker__get_issue",
+                        issue_id="ISSUE-1",
+                    )
+                ),
+                plan_reply(),
+            ]
+        ),
+        skills_enabled=False,
+        mcp_config=ROOT / "config" / "mcp.json",
+    )
+    agent.mcp._tools["mcp__project_tracker__get_issue"]["read_only"] = False
+
+    state = agent.start("Plan without MCP side effects")
+
+    assert state["phase"] == "waiting_plan"
+    assert not any(
+        event["type"] == "mcp_call" for event in agent.store.events(state["session_id"])
+    )
+    assert "read-only" in json.loads(state["calls"]["early"]["result"])["error"]
+
+
 def test_agent_cannot_finish_test_task_without_model_bash_call(tmp_path: Path) -> None:
     project = make_project(tmp_path)
     agent = make_agent(
@@ -615,6 +670,7 @@ def test_agent_cannot_finish_test_task_without_model_bash_call(tmp_path: Path) -
 
     assert failed["phase"] == "failed"
     assert failed["error"] == "task verify has no verified result"
+    assert failed["answer"] == "Done."
     assert all(item["name"] != "Bash" for item in failed["calls"].values())
     assert failed["tasks"][-1]["evidence"] is None
 
@@ -1269,6 +1325,32 @@ def test_doctor_does_not_flag_similar_normal_run(tmp_path: Path) -> None:
     assert report["findings"] == []
 
 
+def test_doctor_shows_usage_for_each_run(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    session = store.create_session()
+    store.create(
+        {
+            "id": "first",
+            "session_id": session,
+            "usage": {"input_tokens": 100, "output_tokens": 20, "complete": True},
+        }
+    )
+    store.create(
+        {
+            "id": "second",
+            "session_id": session,
+            "usage": {"input_tokens": 50, "output_tokens": 5, "complete": False},
+        }
+    )
+
+    report = analyze_session(store, session)
+
+    assert report["run_usage"][0]["input_tokens"] == 100
+    assert report["run_usage"][1]["input_tokens"] is None
+    assert "Run first: tokens input=100; output=20" in format_report(report)
+    assert "Run second: tokens unknown or incomplete" in format_report(report)
+
+
 def test_eval_runner_restores_trials_checks_results_and_resumes(
     tmp_path: Path,
 ) -> None:
@@ -1335,12 +1417,45 @@ def test_eval_runner_restores_trials_checks_results_and_resumes(
 
     assert len(first) == len(second) == 2
     assert all(item["outcome_pass"] for item in first)
+    assert all(item["answer"] == "Created IDs." for item in first)
     assert {item["variant"] for item in first} == {"A", "B"}
     assert (tmp_path / "results" / "summary.md").is_file()
     summary = (tmp_path / "results" / "summary.md").read_text()
     assert "routing errors:" in summary
     assert "usage complete:" in summary
     assert len((tmp_path / "results" / "results.jsonl").read_text().splitlines()) == 2
+
+
+def test_eval_checks_real_files_and_explanations(tmp_path: Path) -> None:
+    fixture = ROOT / "evals" / "fixtures" / "fix-failing-test"
+    workspace = tmp_path / "workspace"
+    shutil.copytree(fixture, workspace)
+    (workspace / "order.py").write_text(FIXED, encoding="utf-8")
+    completed = {"phase": "completed", "answer": "Tests passed."}
+
+    assert check_result("order_tests", workspace, completed, [], fixture)
+    (workspace / "test_order.py").write_text(
+        (workspace / "test_order.py").read_text() + "\n", encoding="utf-8"
+    )
+    assert not check_result("order_tests", workspace, completed, [], fixture)
+
+    (workspace / "review.md").write_text(
+        "Correctness\nMaintainability\nTests", encoding="utf-8"
+    )
+    assert not check_result("review_report", workspace, completed, [], fixture)
+    (workspace / "review.md").write_text(
+        "Correctness\nSafety\nMaintainability\nTests", encoding="utf-8"
+    )
+    assert check_result("review_report", workspace, completed, [], fixture)
+
+    failed = {"phase": "failed", "error": "task has no verified result"}
+    assert not check_result("missing_data", workspace, failed, [], fixture)
+    failed["answer"] = "Source file is missing; I cannot create a summary."
+    assert check_result("missing_data", workspace, failed, [], fixture)
+    mcp_events = [{"type": "mcp_result", "data": {"ok": False}}]
+    assert not check_result("mcp_failure", workspace, completed, mcp_events, fixture)
+    failed["answer"] = "MCP returned an error; no issue data is available."
+    assert check_result("mcp_failure", workspace, failed, mcp_events, fixture)
 
 
 def test_market_detects_new_update_and_does_not_restage(tmp_path: Path) -> None:
@@ -1359,6 +1474,8 @@ def test_market_detects_new_update_and_does_not_restage(tmp_path: Path) -> None:
         "broken-skill",
     }
     assert first["updates"][0]["name"] == "investigate-test-failure"
+    assert first["updates"][0]["old_revision"]
+    assert first["updates"][0]["revision"]
     assert first["staged"] == ["investigate-test-failure"]
     assert second["staged"] == []
     assert market.candidate("investigate-test-failure").is_dir()
@@ -1454,20 +1571,22 @@ def update_results(*, regression: bool = False, complete: bool = True) -> list[d
         "mcp-failure",
     ):
         for variant in ("old", "new"):
-            passed = not (
-                regression and case_id == "python-review" and variant == "new"
-            )
-            results.append(
-                {
-                    "case_id": case_id,
-                    "variant": variant,
-                    "outcome_pass": passed,
-                    "routing_pass_or_na": True,
-                    "usage_complete": complete,
-                    "input_tokens": 100 if complete else None,
-                    "output_tokens": 10 if complete else None,
-                }
-            )
+            for trial in range(1, 4):
+                passed = not (
+                    regression and case_id == "python-review" and variant == "new"
+                )
+                results.append(
+                    {
+                        "case_id": case_id,
+                        "variant": variant,
+                        "trial": trial,
+                        "outcome_pass": passed,
+                        "routing_pass_or_na": True,
+                        "usage_complete": complete,
+                        "input_tokens": 100 if complete else None,
+                        "output_tokens": 10 if complete else None,
+                    }
+                )
     return results
 
 
@@ -1490,6 +1609,15 @@ def test_update_decision_accepts_only_non_regressing_complete_results(
     assert any("decreased" in reason for reason in regressed["reasons"])
     assert incomplete["accepted"] is False
     assert "token usage is incomplete" in incomplete["reasons"]
+    assert updater.decide(update_results()[:-1])["accepted"] is False
+
+
+def test_update_cli_can_request_a_fresh_comparison() -> None:
+    arguments = parser().parse_args(
+        ["update", "evaluate", "investigate-test-failure", "--fresh"]
+    )
+
+    assert arguments.fresh is True
 
 
 def test_skill_update_applies_atomically_and_rolls_back(tmp_path: Path) -> None:
@@ -1506,6 +1634,32 @@ def test_skill_update_applies_atomically_and_rolls_back(tmp_path: Path) -> None:
     )
     updater.market.stage("investigate-test-failure")
 
+    with pytest.raises(UpdateError, match="accepted eval decision"):
+        updater.apply("investigate-test-failure")
+    decision_file = (
+        tmp_path
+        / "updates"
+        / "comparisons"
+        / "investigate-test-failure"
+        / "decision.json"
+    )
+    decision_file.parent.mkdir(parents=True)
+    decision = {
+        "accepted": False,
+        "action": "rejected",
+        "old_version": "1.0.0",
+        "new_version": "2.0.0",
+        "candidate_revision": updater.market.catalog["investigate-test-failure"][
+            "revision"
+        ],
+        "trials": 30,
+    }
+    decision_file.write_text(json.dumps(decision), encoding="utf-8")
+    with pytest.raises(UpdateError, match="matching accepted"):
+        updater.apply("investigate-test-failure")
+    decision.update(accepted=True, action="ready")
+    decision_file.write_text(json.dumps(decision), encoding="utf-8")
+
     applied = updater.apply("investigate-test-failure")
     assert applied["old_version"] == "1.0.0"
     assert SkillRegistry(skills).load("investigate-test-failure").version == "2.0.0"
@@ -1515,3 +1669,66 @@ def test_skill_update_applies_atomically_and_rolls_back(tmp_path: Path) -> None:
     assert SkillRegistry(skills).load("investigate-test-failure").version == "1.0.0"
     with pytest.raises(UpdateError, match="no rollback"):
         updater.rollback("investigate-test-failure")
+
+
+def test_chat_can_roll_back_an_accepted_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = make_project(tmp_path)
+    skills = project[0].parent / "skills"
+    shutil.copytree(
+        ROOT / "skills" / "investigate-test-failure",
+        skills / "investigate-test-failure",
+    )
+    updater = SkillUpdater(
+        project[0].parent,
+        ROOT / "config" / "market.json",
+        skills_dir=skills,
+        state_dir=project[0].parent / "updates",
+    )
+    updater.market.stage("investigate-test-failure")
+    decision = {
+        "accepted": True,
+        "action": "ready",
+        "old_version": "1.0.0",
+        "new_version": "2.0.0",
+        "candidate_revision": updater.market.catalog["investigate-test-failure"][
+            "revision"
+        ],
+        "trials": 30,
+    }
+    decision_file = (
+        project[0].parent
+        / "updates"
+        / "comparisons"
+        / "investigate-test-failure"
+        / "decision.json"
+    )
+    decision_file.parent.mkdir(parents=True)
+    decision_file.write_text(json.dumps(decision), encoding="utf-8")
+    updater.apply("investigate-test-failure")
+    agent = Agent(
+        project[0],
+        project[1],
+        project[2],
+        FakeModel([]),
+        skills_dir=skills,
+        market_config=ROOT / "config" / "market.json",
+    )
+    inputs = iter(
+        [
+            "/update rollback investigate-test-failure",
+            "/update rollback investigate-test-failure",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    assert chat_loop(agent, "auto", None) == 0
+    assert SkillRegistry(skills).load("investigate-test-failure").version == "1.0.0"
+    output = capsys.readouterr().out
+    assert "to_version: 1.0.0" in output
+    assert "no rollback version is available" in output
+    assert "Session closed." in output

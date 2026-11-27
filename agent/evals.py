@@ -8,6 +8,8 @@ from pathlib import Path
 from agent.engine import Agent
 from agent.model import ChatModel
 
+CHECKER_VERSION = 2
+
 
 class EvalError(RuntimeError):
     pass
@@ -111,7 +113,13 @@ class EvalRunner:
         events_file = trial_root / "events.jsonl"
         agent.store.export_events(session_id, events_file)
         events = agent.store.events(session_id)
-        outcome = check_result(case["checker"], workspace, state, events)
+        outcome = check_result(
+            case["checker"],
+            workspace,
+            state,
+            events,
+            self.root / case["fixture"],
+        )
         loaded = sorted(state.get("loaded_skills", {}))
         expected = case["expected_skill"]
         routing = (
@@ -127,12 +135,14 @@ class EvalRunner:
         required_tools_ok = all(name in called_tools for name in case["required_tools"])
         usage = state.get("usage", {})
         return {
+            "checker_version": CHECKER_VERSION,
             "case_id": case["id"],
             "variant": variant,
             "trial": trial,
             "session_id": session_id,
             "run_id": state["id"],
             "phase": state["phase"],
+            "answer": state.get("answer"),
             "outcome_pass": bool(outcome and required_tools_ok),
             "routing_pass_or_na": routing,
             "input_tokens": usage.get("input_tokens")
@@ -190,11 +200,16 @@ class EvalRunner:
 
 
 def check_result(
-    checker: str, workspace: Path, state: dict, events: list[dict]
+    checker: str,
+    workspace: Path,
+    state: dict,
+    events: list[dict],
+    fixture: Path,
 ) -> bool:
     if checker == "order_tests":
         test_file = workspace / "test_order.py"
-        before = hashlib.sha256(test_file.read_bytes()).hexdigest()
+        if not test_file.is_file():
+            return False
         result = subprocess.run(
             ["python3", "-m", "unittest", "-v"],
             cwd=workspace,
@@ -202,32 +217,58 @@ def check_result(
             timeout=10,
             check=False,
         )
-        after = hashlib.sha256(test_file.read_bytes()).hexdigest()
-        return result.returncode == 0 and before == after
+        expected_hash = hashlib.sha256(
+            (fixture / "test_order.py").read_bytes()
+        ).hexdigest()
+        actual_hash = hashlib.sha256(test_file.read_bytes()).hexdigest()
+        return (
+            state["phase"] == "completed"
+            and result.returncode == 0
+            and expected_hash == actual_hash
+        )
     if checker == "review_report":
         path = workspace / "review.md"
         if not path.is_file():
             return False
         text = path.read_text(encoding="utf-8").lower()
-        return all(word in text for word in ("correctness", "maintainability", "tests"))
+        return all(
+            word in text
+            for word in ("correctness", "safety", "maintainability", "tests")
+        )
     if checker == "json_ids":
         path = workspace / "ids.json"
         if not path.is_file():
             return False
         try:
-            return set(json.loads(path.read_text(encoding="utf-8"))) == {"T1", "T3"}
+            values = json.loads(path.read_text(encoding="utf-8"))
+            return (
+                isinstance(values, list)
+                and len(values) == 2
+                and all(isinstance(value, str) for value in values)
+                and set(values) == {"T1", "T3"}
+            )
         except (json.JSONDecodeError, TypeError):
             return False
     if checker == "missing_data":
-        return (
-            not (workspace / "summary.json").exists() and state["phase"] != "completed"
+        answer = str(state.get("answer") or "").lower()
+        return not (workspace / "summary.json").exists() and any(
+            word in answer
+            for word in ("missing", "unavailable", "not found", "отсутств")
         )
     if checker == "mcp_failure":
         failed_mcp = any(
             event["type"] == "mcp_result" and not event["data"].get("ok")
             for event in events
         )
-        return failed_mcp and not (workspace / "issue-report.json").exists()
+        answer = str(state.get("answer") or "").lower()
+        return (
+            failed_mcp
+            and not (workspace / "issue-report.json").exists()
+            and any(
+                word in answer
+                for word in ("error", "failed", "unavailable", "ошиб", "недоступ")
+            )
+        )
     raise EvalError(f"unknown checker: {checker}")
 
 

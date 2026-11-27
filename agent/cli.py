@@ -78,6 +78,7 @@ def parser() -> argparse.ArgumentParser:
     update_evaluate = update_commands.add_parser("evaluate")
     update_evaluate.add_argument("name")
     update_evaluate.add_argument("--trials", type=int, default=3)
+    update_evaluate.add_argument("--fresh", action="store_true")
     for name in ("status", "apply", "rollback"):
         update_commands.add_parser(name).add_argument("name")
     return result
@@ -91,7 +92,9 @@ def main(arguments: list[str] | None = None) -> int:
             updater = SkillUpdater(root, arguments_object.market)
             if arguments_object.update_command == "evaluate":
                 result = updater.evaluate(
-                    arguments_object.name, arguments_object.trials
+                    arguments_object.name,
+                    arguments_object.trials,
+                    arguments_object.fresh,
                 )
             elif arguments_object.update_command == "apply":
                 result = updater.apply(arguments_object.name)
@@ -241,7 +244,9 @@ def show(state: dict) -> None:
 def chat_loop(agent: Agent, mode: str, session_id: str | None) -> int:
     session_id = agent.store.create_session(session_id)
     print(f"Session: {session_id}")
-    print("Commands: /stats, /events, /exit")
+    print(
+        "Commands: /stats, /events, /update status NAME, /update rollback NAME, /exit"
+    )
     while True:
         try:
             request = input("You> ").strip()
@@ -259,6 +264,30 @@ def chat_loop(agent: Agent, mode: str, session_id: str | None) -> int:
         if request == "/events":
             for event in agent.store.events(session_id):
                 print(format_event(event))
+            continue
+        if request.startswith("/update "):
+            parts = request.split()
+            if len(parts) != 3 or parts[1] not in {"status", "rollback"}:
+                print("Use /update status NAME or /update rollback NAME.")
+                continue
+            if agent.market.config_file is None:
+                print("Market is not configured.")
+                continue
+            try:
+                updater = SkillUpdater(
+                    agent.skills.root.parent,
+                    agent.market.config_file,
+                    skills_dir=agent.skills.root,
+                    state_dir=agent.store.filename.parent / "updates",
+                )
+                result = (
+                    updater.status(parts[2])
+                    if parts[1] == "status"
+                    else updater.rollback(parts[2])
+                )
+                print_update_result(result)
+            except (MarketError, UpdateError, ValueError, KeyError) as error:
+                print(f"Error: {error}")
             continue
         state = agent.start(request, mode, session_id)
         while state["phase"] in {"waiting_plan", "waiting_action", "uncertain"}:

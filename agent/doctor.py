@@ -7,6 +7,18 @@ from agent.storage import Store
 def analyze_session(store: Store, session_id: str) -> dict:
     events = store.events(session_id)
     stats = store.session_stats(session_id)
+    run_usage = []
+    for run in store.session_runs(session_id):
+        usage = run.get("usage", {})
+        complete = usage.get("complete") is True
+        run_usage.append(
+            {
+                "run_id": run["id"],
+                "input_tokens": usage.get("input_tokens") if complete else None,
+                "output_tokens": usage.get("output_tokens") if complete else None,
+                "usage_complete": complete,
+            }
+        )
     findings = []
     by_run: dict[str, list[dict]] = {}
     for event in events:
@@ -71,6 +83,7 @@ def analyze_session(store: Store, session_id: str) -> dict:
         "session_id": session_id,
         "events_analyzed": len(events),
         "stats": stats,
+        "run_usage": run_usage,
         "findings": findings,
         "limitations": [] if events else ["No events are available for this session."],
     }
@@ -110,6 +123,13 @@ def format_report(report: dict) -> str:
         f"Tools: {stats['tools'] or 'none'}",
         f"MCP calls: {stats['mcp'] or 'none'}",
     ]
+    for run in report["run_usage"]:
+        detail = (
+            f"input={run['input_tokens']}; output={run['output_tokens']}"
+            if run["usage_complete"]
+            else "unknown or incomplete"
+        )
+        lines.append(f"Run {run['run_id']}: tokens {detail}")
     if not report["findings"]:
         lines.append("Findings: none")
     for index, item in enumerate(report["findings"], 1):

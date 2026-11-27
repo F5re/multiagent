@@ -94,6 +94,7 @@ class Market:
                     {
                         **public_entry(item),
                         "old_version": current.version,
+                        "old_revision": package_hash(current.path.parent),
                     }
                 )
                 if self.config.get("auto_update", False) and self.stage(name):

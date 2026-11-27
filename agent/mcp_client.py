@@ -76,6 +76,9 @@ class MCPClient:
     def names(self) -> set[str]:
         return set(self._tools)
 
+    def is_read_only(self, name: str) -> bool:
+        return bool(self._tools[name]["read_only"])
+
     def validate(self, name: str, arguments: object) -> None:
         if name not in self._tools:
             raise ValueError(f"unknown MCP tool: {name}")
